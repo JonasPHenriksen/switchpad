@@ -31,3 +31,7 @@ See **[SETUP.md](SETUP.md)** for the full step-by-step guide.
 |---|---|
 | `pi/` | `switchpad.py` (the bridge on the Pi), `install.sh`, `firstboot.sh` |
 | `windows/` | `SwitchPadBridge.cs` + `build.cmd`, and the helper scripts: `prepare-sd`, `check-sd`, `collect-logs`, `update-pi` |
+
+## License
+
+[MIT](LICENSE)
