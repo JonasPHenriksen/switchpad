@@ -1,0 +1,11 @@
+# Local dev tools (portable Python, git, GitHub CLI) - not part of the project
+.devtools/
+
+# Build output: run windows\build.cmd to create it
+windows/SwitchPadBridge.exe
+
+# Logs and log bundles
+windows/logs/
+*.log
+
+__pycache__/

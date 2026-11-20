@@ -1,0 +1,10 @@
+# The Pi files run on Linux: they must keep LF line endings, even when cloned on Windows
+# (a .sh file with CRLF fails in bash).
+* text=auto
+pi/** text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+# Windows scripts
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.cs text eol=crlf
