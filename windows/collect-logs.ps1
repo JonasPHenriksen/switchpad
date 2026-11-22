@@ -47,12 +47,20 @@ if ($Pi) {
 
 # 3. Report from the running Pi over SSH
 if ($Pi) {
-    Write-Host "Asking the Pi ($Pi) for a full report. Enter the Pi's password if asked (up to twice)."
+    Write-Host "Asking the Pi ($Pi) for a full report. Enter the Pi's password when asked (up to 4 times)."
     ssh -t $Pi "sudo python3 /boot/firmware/switchpad/switchpad.py report > /dev/null && echo REPORT-OK"
-    # The report, plus the Pi's complete log (the report only has its last lines). One scp, one password.
+    # The report, plus the Pi's complete log (the report only has its last lines).
+    # Two separate downloads: newer SSH versions don't accept {a,b} lists in a remote path.
     $piFiles = New-Item -ItemType Directory -Force (Join-Path $work 'pi')
-    scp "${Pi}:/boot/firmware/switchpad/{report.txt,switchpad.log*}" $piFiles.FullName
-    if (Test-Path (Join-Path $piFiles.FullName 'report.txt')) { Write-Host "Pi report and log: OK" } else { Write-Host "Pi report: FAILED (see messages above)" -ForegroundColor Yellow }
+    Write-Host "Downloading the report..."
+    scp "${Pi}:/boot/firmware/switchpad/report.txt" $piFiles.FullName
+    Write-Host "Downloading the Pi's log..."
+    scp "${Pi}:/boot/firmware/switchpad/switchpad.log*" $piFiles.FullName
+    $gotReport = Test-Path (Join-Path $piFiles.FullName 'report.txt')
+    $gotLog = Test-Path (Join-Path $piFiles.FullName 'switchpad.log')
+    if ($gotReport -and $gotLog) { Write-Host "Pi report and log: OK" }
+    elseif ($gotReport) { Write-Host "Pi report: OK, but the Pi's log FAILED (see messages above)" -ForegroundColor Yellow }
+    else { Write-Host "Pi report: FAILED (see messages above)" -ForegroundColor Yellow }
 }
 
 # 4. The SD card, if it's in this PC

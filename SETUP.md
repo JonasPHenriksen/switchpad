@@ -14,6 +14,10 @@ no motion controls, no rumble and no amiibo. Every normal button and stick works
 > properly. Wi-Fi works, so SwitchPad is Wi-Fi only, and the Pi's Bluetooth radio is
 > switched off to give Wi-Fi the radio chip to itself.
 
+**Using a Raspberry Pi 4 instead?** It can use an Ethernet cable instead of Wi-Fi. The steps
+below are for the Pi Zero W; see [Raspberry Pi 4 on Ethernet](#raspberry-pi-4-on-ethernet)
+for what's different.
+
 ## What you need
 
 - The Pi Zero W (V1.1) and its microSD card. **The card is wiped in step 1.**
@@ -123,6 +127,52 @@ Delete that file to go back.
 
 Use `--layout label` if you want the letters to match instead (Xbox A → Switch A).
 
+## Raspberry Pi 4 on Ethernet
+
+A Pi 4 runs the same software with no changes, and its Ethernet port removes Wi-Fi from
+the chain completely. It should also work on a Pi 5, which has the same USB-C setup, but
+that hasn't been tried.
+
+```
+Switch dock USB-A ──► Pi 4 USB-C port      one cable: power and controller data
+Pi 4 Ethernet ──► network switch / router ◄── PC running Parsec (ideally on a cable too)
+```
+
+**What you need, instead of the Zero's cable and Wi-Fi:**
+- A **USB-A to USB-C data cable** from a USB port on the Switch dock to the Pi 4's
+  **USB-C port**. That one cable both powers the Pi and carries the controller data. Many
+  USB-A to USB-C cables only charge: use one you know carries data (e.g. one that works
+  for file transfer from a phone).
+- An **Ethernet cable** from the Pi 4 to your router or to a network switch that's on the
+  router. The PC must be on the same router, by cable or Wi-Fi.
+
+**Only the USB-C port works as the controller.** The Pi 4's four USB-A ports can only
+talk to devices (like a PC's ports) and can never act as one. The round black jack is the
+audio/video output, not a power input.
+
+**Differences in the steps:**
+- **Step 1:** in Imager choose **Device: Raspberry Pi 4** and **Raspberry Pi OS Lite**
+  (32-bit or 64-bit). Wi-Fi can be left empty. Still set the hostname `switchpad`, a user
+  and password, and enable SSH.
+- **Step 3:** for the first boot, power the Pi from the dock (Switch docked and on) or from
+  any USB-C phone charger. Plug in the Ethernet cable before powering it on.
+- **Step 4:** the router gives the Pi its address. `SwitchPadBridge.exe` finds
+  `switchpad.local` by itself and prints the IP, and the router's device list shows it
+  too. Reserving that address for the Pi in the router keeps it the same.
+- **Step 5** (test on the PC) works the same, with the Pi 4's USB-C port connected to the PC.
+
+**Good to know:**
+- **The Pi runs only while the dock powers it.** When the Switch goes to sleep or is taken
+  out of the dock, the dock may cut power to its USB ports. The Pi then switches off and
+  needs about 30 s to start again once power is back.
+- **Labels:** the programs still call the connection "Wi-Fi": the PC shows `Wi-Fi online`
+  and the Pi's log shows `wifi NOT CONNECTED`. That's normal on a cable and doesn't
+  matter.
+- **If the PC shows `Switch: not connected`:** check that the cable carries data, that it's
+  in the Pi's USB-C port, and that the Switch is docked and awake. To rule out the dock,
+  connect the Pi's USB-C port to the PC and open `joy.cpl` (step 5): if **POKKEN
+  CONTROLLER** appears there, the Pi and cable work.
+
 ## Wi-Fi lag and hiccups
 
 The status line shows **`Ping: N ms`**: the round trip PC → Pi → PC. The delay our part
@@ -157,12 +207,22 @@ To send them, play until the problem happens, close `SwitchPadBridge.exe`, then 
 windows\collect-logs.cmd USER@<Pi's IP>
 ```
 It pings the Pi for 30 s, asks it for a full report over SSH, fetches its complete log,
-and packs everything into **one zip file** in `windows\logs\`. Send that file. Without
-SSH, unplug the Pi, put its SD card in the PC and run `collect-logs.cmd` with no argument.
+and packs everything into **one zip file** in `windows\logs\`. It asks for the Pi's
+password up to 4 times. Send that file. Without SSH, unplug the Pi, put its SD card in the
+PC and run `collect-logs.cmd` with no argument.
+
+**SSH warning "REMOTE HOST IDENTIFICATION HAS CHANGED" / "Host key verification failed":**
+expected after re-flashing the card or switching to another Pi. Every fresh install gets
+new SSH keys, and the PC still remembers the old Pi's key under the same name. Make the PC
+forget it, then run the command again and answer `yes`:
+```
+ssh-keygen -R switchpad.local
+```
+If you connect by IP address, also run it with the IP (e.g. `ssh-keygen -R 192.168.178.151`).
 
 ## Updating the Pi (no re-flash)
 
-**Over SSH** (Pi running and on Wi-Fi):
+**Over SSH** (Pi running and on the network):
 ```
 windows\update-pi.cmd USER@<Pi's IP>
 ```
@@ -180,7 +240,7 @@ about 3 minutes.
 |---|---|
 | `looking up switchpad.local...` | The name lookup is slow or failing. Start with `--pi <IP>` instead (step 4). |
 | `no reply from <IP>` | The Pi is off, still booting, or not on the same network. |
-| `Switch: not connected` | Check the cable is in the Pi's **USB** port, that it's a data cable, and that the dock has power. |
+| `Switch: not connected` | Check the cable is in the Pi's **USB** port (Pi 4: the **USB-C** port), that it's a data cable, and that the Switch is docked and awake. |
 
 With SSH: the service log is `journalctl -u switchpad -f`, and
 `sudo python3 /boot/firmware/switchpad/switchpad.py status` shows whether the Switch is
