@@ -45,7 +45,7 @@ install -m 755 "$HERE/switchpad.py" /opt/switchpad/switchpad.py
 echo "5/5 Installing systemd service"
 cat > /etc/systemd/system/switchpad.service <<'EOF'
 [Unit]
-Description=SwitchPad (Wi-Fi -> Switch USB controller bridge)
+Description=SwitchPad (network -> Switch USB controller bridge)
 After=sys-kernel-config.mount network.target
 
 [Service]
@@ -62,7 +62,7 @@ systemctl daemon-reload
 systemctl enable switchpad.service
 
 echo "USB device mode line in config.txt: $(grep -c '^dtoverlay=dwc2,dr_mode=peripheral' "$CONFIG")"
-echo "INSTALL OK (v3: Wi-Fi only, runs switchpad.py from the SD card). After the next boot, start SwitchPadBridge.exe on the PC."
+echo "INSTALL OK (v3: network only, runs switchpad.py from the SD card). After the next boot, start SwitchPad.exe on the PC."
 sync
 if [ "$REBOOT" = 1 ]; then
     echo "Rebooting in 5 seconds."

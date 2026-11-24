@@ -516,6 +516,7 @@ class PingGraph : Control
 class MainForm : Form
 {
     [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr handle);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, string l);
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string CaptureHint = "Click a button on the controller (or double-click a row), then press the key you want for it.";
 
@@ -530,11 +531,13 @@ class MainForm : Form
     StatusTile tilePi, tileSwitch, tilePing, tileInput;
     PadView dashPad, mapPad;
     PingGraph graph;
-    Label lblDetails, lblCapture, lblPiHint, lblSlots;
+    Label lblDetails, lblCapture, lblPiHint, lblSlots, lblHealthNote, lblReplies;
+    readonly Dictionary<string, Label> healthValues = new Dictionary<string, Label>();
+    Button btnSelftest, btnRestart, btnReboot;
     ListView mapList;
     CheckBox chkKeyboard, chkBlock, chkRemote, chkStartup, chkMinimized;
     NumericUpDown numWalk, numTrigger, numDeadzone;
-    TextBox txtPi, txtLog;
+    TextBox txtPi, txtLog, txtUser;
     ComboBox cmbPad, cmbLayout;
     TabControl tabs;
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
@@ -604,11 +607,23 @@ class MainForm : Form
         tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(S(14), S(5)) };
         tabs.TabPages.Add(BuildDashboard());
         tabs.TabPages.Add(BuildKeyboard());
+        tabs.TabPages.Add(BuildPi());
         tabs.TabPages.Add(BuildSettings());
         tabs.TabPages.Add(BuildLog());
         tabs.SelectedIndexChanged += (s, e) => CancelCapture(null);
         root.Controls.Add(tabs, 0, 1);
         Controls.Add(root);
+        foreach (Control c in new Control[] { txtPi, txtUser, numTrigger, numDeadzone, numWalk }) PauseKeysWhileFocused(c);
+    }
+
+    // Typing a Pi address or a number must not press Switch buttons.
+    readonly List<Control> pauseControls = new List<Control>();
+
+    void PauseKeysWhileFocused(Control c)
+    {
+        pauseControls.Add(c);
+        c.Enter += (s, e) => KeyboardHook.Paused = true;
+        c.Leave += (s, e) => KeyboardHook.Paused = false;
     }
 
     StatusTile Tile(string title)
@@ -770,6 +785,278 @@ class MainForm : Form
         return page;
     }
 
+    static readonly string[][] HealthRows =
+    {
+        new[] { "model", "Model" },
+        new[] { "sw", "SwitchPad on the Pi" },
+        new[] { "net", "Network" },
+        new[] { "temp", "CPU temperature" },
+        new[] { "power", "Power" },
+        new[] { "usb", "USB to the Switch" },
+        new[] { "up", "Running for" },
+        new[] { "packets", "Packets from this PC" },
+        new[] { "problems", "Hiccups and errors" },
+        new[] { "load", "CPU load" },
+        new[] { "selftest", "Last self-test" },
+    };
+
+    TabPage BuildPi()
+    {
+        var page = Page("Pi");
+        var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+
+        var left = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = new Padding(0, 0, S(16), 0) };
+        left.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        left.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        int row = 0;
+        AddSpan(left, ref row, Heading("Health"));
+        foreach (var hr in HealthRows)
+        {
+            left.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            left.Controls.Add(new Label { Text = hr[1], AutoSize = true, ForeColor = Pal.Muted, Margin = new Padding(0, S(4), S(14), S(4)) }, 0, row);
+            var v = new Label { Text = "–", AutoSize = true, Margin = new Padding(0, S(4), 0, S(4)), MaximumSize = new Size(S(300), 0) };
+            healthValues[hr[0]] = v;
+            left.Controls.Add(v, 1, row);
+            row++;
+        }
+        lblHealthNote = Hint("");
+        lblHealthNote.Margin = new Padding(0, S(10), 0, 0);
+        lblHealthNote.MaximumSize = new Size(S(420), 0);
+        AddSpan(left, ref row, lblHealthNote);
+        left.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        left.Controls.Add(new Label(), 0, row);
+        grid.Controls.Add(left, 0, 0);
+
+        var right = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = new Padding(0) };
+        right.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        right.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        row = 0;
+        AddSpan(right, ref row, Heading("Controls"));
+        btnSelftest = ActionRow(right, ref row, "Run self-test",
+            "The Pi plays the test pattern by itself (12 s) and checks that the Switch takes every report. " +
+            "Tests the Pi and its cable without the network. Your input pauses meanwhile.", (s, e) => engine.Command("selftest"));
+        btnRestart = ActionRow(right, ref row, "Restart SwitchPad", "Restarts the program on the Pi. The controller is gone for about 5 s.",
+            (s, e) => { if (Confirm("Restart SwitchPad on the Pi? The controller is gone for about 5 seconds.")) engine.Command("restart"); });
+        btnReboot = ActionRow(right, ref row, "Reboot Pi", "Restarts the whole Pi. The controller is gone for about a minute.",
+            (s, e) => { if (Confirm("Reboot the Pi? The controller is gone for about a minute.")) engine.Command("reboot"); });
+
+        var ssh = Heading("Over SSH (asks for the Pi's password)");
+        ssh.Margin = new Padding(0, S(16), 0, S(6));
+        AddSpan(right, ref row, ssh);
+        txtUser = new TextBox { Width = S(220), Margin = new Padding(0, S(3), 0, S(3)) };
+        txtUser.Leave += (s, e) => SaveUser();
+        txtUser.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; SaveUser(); } };
+        txtUser.HandleCreated += (s, e) => SendMessage(txtUser.Handle, 0x1501 /* EM_SETCUEBANNER */, (IntPtr)1, "as chosen in Raspberry Pi Imager");
+        tips.SetToolTip(txtUser, "The user name you chose for the Pi in Raspberry Pi Imager (step 1 of SETUP.md).");
+        right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        right.Controls.Add(new Label { Text = "Pi user name", AutoSize = true, Margin = new Padding(0, S(6), S(10), 0) }, 0, row);
+        right.Controls.Add(txtUser, 1, row);
+        row++;
+        ActionRow(right, ref row, "Collect logs…",
+            "Opens a window running collect-logs.cmd: pings the Pi, gets its report and log, and zips them with this PC's logs.",
+            (s, e) => RunScript("collect-logs.cmd"));
+        ActionRow(right, ref row, "Update Pi…",
+            "Opens a window running update-pi.cmd: copies the pi folder from this project onto the Pi and restarts SwitchPad there.",
+            (s, e) => RunScript("update-pi.cmd"));
+
+        var answers = Heading("Answers from the Pi");
+        answers.Margin = new Padding(0, S(16), 0, S(6));
+        AddSpan(right, ref row, answers);
+        // the answers fill the rest of the column, newest first
+        lblReplies = new Label { Dock = DockStyle.Fill, AutoSize = false, ForeColor = Pal.Text, Text = "Nothing sent yet." };
+        right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        right.Controls.Add(lblReplies, 0, row);
+        right.SetColumnSpan(lblReplies, 2);
+        grid.Controls.Add(right, 1, 0);
+
+        page.Controls.Add(grid);
+        return page;
+    }
+
+    void AddSpan(TableLayoutPanel t, ref int row, Control c)
+    {
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        t.Controls.Add(c, 0, row);
+        t.SetColumnSpan(c, 2);
+        row++;
+    }
+
+    Button ActionRow(TableLayoutPanel t, ref int row, string text, string hint, EventHandler click)
+    {
+        var b = new Button { Text = text, Width = S(160), Height = S(30), Margin = new Padding(0, S(4), S(10), S(4)) };
+        b.Click += click;
+        var h = Hint(hint);
+        h.Margin = new Padding(0, S(4), 0, S(4));
+        h.MaximumSize = new Size(S(290), 0);
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        t.Controls.Add(b, 0, row);
+        t.Controls.Add(h, 1, row);
+        row++;
+        return b;
+    }
+
+    bool Confirm(string question)
+    {
+        return MessageBox.Show(this, question, "SwitchPad", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
+    }
+
+    void SaveUser()
+    {
+        string u = txtUser.Text.Trim();
+        if (u != cfg.PiUser) Change(x => x.PiUser = u);
+    }
+
+    static readonly System.Text.RegularExpressions.Regex SafeName = new System.Text.RegularExpressions.Regex(@"^[A-Za-z0-9._-]+$");
+
+    // collect-logs.cmd / update-pi.cmd in their own console window: they ask for the Pi's password there.
+    void RunScript(string name)
+    {
+        SaveUser();
+        string user = cfg.PiUser;
+        var sn = engine.Snap;
+        string host = sn.Address.Length > 0 ? sn.Address : cfg.Pi;
+        if (!SafeName.IsMatch(user))
+        {
+            MessageBox.Show(this, "Enter the Pi's user name first (the one you chose in Raspberry Pi Imager).", "SwitchPad",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            txtUser.Focus();
+            return;
+        }
+        if (!SafeName.IsMatch(host))
+        {
+            MessageBox.Show(this, "The Pi's address '" + host + "' doesn't look right. Check it under Settings.", "SwitchPad",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        string dir = AppDomain.CurrentDomain.BaseDirectory;
+        string path = Path.Combine(dir, name);
+        if (!File.Exists(path))
+        {
+            MessageBox.Show(this, "Can't find " + path + ".\nThis button needs SwitchPad.exe to stay in the project's windows folder.",
+                "SwitchPad", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        try
+        {
+            var psi = new ProcessStartInfo("cmd.exe", "/c \"\"" + path + "\" " + user + "@" + host + "\"");
+            psi.WorkingDirectory = dir;
+            psi.UseShellExecute = true;
+            Process.Start(psi);
+            Log.Write("Started " + name + " " + user + "@" + host + " in its own window");
+        }
+        catch (Exception e) { Log.Write("Could not start " + name + ": " + e.Message); }
+    }
+
+    static string Dur(double seconds)
+    {
+        if (double.IsNaN(seconds)) return "–";
+        long s = (long)seconds;
+        if (s < 60) return s + " s";
+        if (s < 3600) return (s / 60) + " min";
+        if (s < 86400) return (s / 3600) + " h " + (s % 3600 / 60) + " min";
+        return (s / 86400) + " d " + (s % 86400 / 3600) + " h";
+    }
+
+    static string Count(PiHealth h, string key)
+    {
+        double v = h.Num(key);
+        return double.IsNaN(v) ? "?" : v.ToString("N0", CultureInfo.CurrentCulture);
+    }
+
+    void SetHealth(string key, string text, Color color)
+    {
+        var l = healthValues[key];
+        if (l.Text != text) l.Text = text;
+        if (l.ForeColor != color) l.ForeColor = color;
+    }
+
+    void UpdatePiTab(Snapshot sn)
+    {
+        var h = sn.Health;
+        bool fresh = h != null && Clock.Ms - h.ReceivedMs < 10000;
+        btnSelftest.Enabled = btnRestart.Enabled = btnReboot.Enabled = sn.Online;
+
+        string note;
+        if (!sn.Online)
+            note = "The Pi isn't answering." + (h != null ? " These values are from " + Ago(Clock.Ms - h.ReceivedMs) + "." : "");
+        else if (!fresh && sn.OnlineSinceMs >= 0 && Clock.Ms - sn.OnlineSinceMs > 6000)
+            note = "The Pi answers, but sends no health information: its SwitchPad software is older than this PC's. Use Update Pi.";
+        else if (!fresh) note = "Waiting for the Pi's health information…";
+        else note = "Updated " + Ago(Clock.Ms - h.ReceivedMs) + (h["host"].Length > 0 ? ". Host name: " + h["host"] : "") + ".";
+        if (lblHealthNote.Text != note) lblHealthNote.Text = note;
+
+        var newestFirst = (string[])sn.CommandLines.Clone();
+        Array.Reverse(newestFirst);
+        string replies = newestFirst.Length == 0 ? "Nothing sent yet." : string.Join("\n", newestFirst);
+        if (lblReplies.Text != replies) lblReplies.Text = replies;
+
+        if (h == null)
+        {
+            foreach (var hr in HealthRows) SetHealth(hr[0], "–", Pal.Idle);
+            return;
+        }
+        bool live = fresh && sn.Online;
+        Func<Color, Color> c = col => live ? col : Pal.Idle;
+
+        SetHealth("model", h["model"], c(Pal.Text));
+        SetHealth("sw", h["sw"], c(Pal.Text));
+        string net = h["link_text"] + (h["dev"].Length > 0 ? "  (" + h["dev"] + ")" : "");
+        bool netBad = h["link"] == "none" || h["link_text"].Contains("NO CABLE") || h["link_text"].Contains("NOT CONNECTED");
+        SetHealth("net", net, c(netBad ? Pal.Bad : Pal.Text));
+
+        double t = h.Num("temp");
+        if (double.IsNaN(t)) SetHealth("temp", "–", c(Pal.Idle));
+        else SetHealth("temp", t.ToString("0.0", CultureInfo.CurrentCulture) + " °C" +
+                               (t >= 80 ? "  (too hot: the Pi slows itself down)" : t >= 70 ? "  (warm)" : ""),
+                       c(t >= 80 ? Pal.Bad : t >= 70 ? Pal.Warn : Pal.Good));
+
+        Color pc;
+        SetHealth("power", PowerText(h, out pc), c(pc));
+        Color uc;
+        SetHealth("usb", UsbText(h["usb"], h["usb_speed"], out uc), c(uc));
+        SetHealth("up", "Pi " + Dur(h.Num("uptime")) + "   ·   SwitchPad " + Dur(h.Num("running")), c(Pal.Text));
+        SetHealth("packets", Count(h, "rx") + " received, " + Count(h, "lost") + " lost, " + Count(h, "late") + " out of order", c(Pal.Text));
+        bool clean = h.Num("hiccups") == 0 && h.Num("failsafe") == 0 && h.Num("usb_err") == 0;
+        SetHealth("problems", Count(h, "hiccups") + " network gaps over 150 ms, " + Count(h, "failsafe") + " failsafe releases, " +
+                              Count(h, "usb_err") + " USB write errors", c(clean ? Pal.Good : Pal.Warn));
+        SetHealth("load", h["load"].Length > 0 ? h["load"] : "–", c(Pal.Text));
+        string st = h["selftest"];
+        SetHealth("selftest", st.Length == 0 ? "not run since SwitchPad started on the Pi" : st == "running" ? "running…" : st,
+            c(st.Contains("FAILED") ? Pal.Bad : st.Contains("OK") ? Pal.Good : Pal.Text));
+    }
+
+    // get_throttled bits: 0 under-voltage now, 1 frequency capped now, 2 throttled now, 3 soft
+    // temperature limit now; 16-19 the same "since boot".
+    static string PowerText(PiHealth h, out Color color)
+    {
+        long f = h.PowerFlags;
+        if (f < 0) { color = Pal.Idle; return h["power_text"].Length > 0 ? h["power_text"] : "–"; }
+        if ((f & 0x1) != 0) { color = Pal.Bad; return "UNDER-VOLTAGE NOW: the power supply or cable is too weak"; }
+        if ((f & 0xE) != 0) { color = Pal.Warn; return "Slowed down now (too hot or low voltage)"; }
+        if ((f & 0x10000) != 0) { color = Pal.Warn; return "OK now, but there was under-voltage since the Pi started"; }
+        if ((f & 0xE0000) != 0) { color = Pal.Warn; return "OK now, but it was slowed down since the Pi started"; }
+        color = Pal.Good;
+        return "OK";
+    }
+
+    static string UsbText(string state, string speed, out Color color)
+    {
+        string s;
+        switch (state)
+        {
+            case "configured": color = Pal.Good; s = "In use by the Switch"; break;
+            case "not attached": color = Pal.Bad; s = "Not connected (cable, or Switch not docked / asleep?)"; break;
+            case "suspended": color = Pal.Warn; s = "Suspended (is the Switch asleep?)"; break;
+            case "gadget not bound": color = Pal.Bad; s = "USB controller mode isn't set up on the Pi"; break;
+            case "": case "None": color = Pal.Idle; s = "–"; break;
+            default: color = Pal.Warn; s = "Connecting (" + state + ")"; break;
+        }
+        if (speed.Length > 0 && speed != "UNKNOWN" && state == "configured") s += ", " + speed;
+        return s;
+    }
+
     TabPage BuildSettings()
     {
         var page = Page("Settings");
@@ -781,8 +1068,6 @@ class MainForm : Form
 
         txtPi = new TextBox { Width = S(200), Margin = new Padding(0, S(4), S(6), S(4)) };
         txtPi.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; ApplyPi(); } };
-        txtPi.Enter += (s, e) => KeyboardHook.Paused = true;   // typing an address must not press Switch buttons
-        txtPi.Leave += (s, e) => KeyboardHook.Paused = false;
         lblPiHint = Hint("Name or IP address of the Pi. The IP address connects faster.");
         AddRow(t, ref row, "Pi address", Flow(txtPi, Btn("Apply", (s, e) => ApplyPi()), Btn("Find Pi", (s, e) => FindPi())), lblPiHint);
 
@@ -854,6 +1139,7 @@ class MainForm : Form
     {
         loading = true;
         txtPi.Text = cfg.Pi;
+        txtUser.Text = cfg.PiUser;
         cmbPad.SelectedIndex = cfg.Pad + 1;
         cmbLayout.SelectedIndex = cfg.Positional ? 0 : 1;
         numTrigger.Value = cfg.TriggerThreshold;
@@ -1065,7 +1351,17 @@ class MainForm : Form
         ticks++;
         var sn = engine.Snap;
 
-        if (sn.Online) tilePi.Set("Online", sn.Address, Pal.Good);
+        var h = sn.Health;
+        bool fresh = h != null && Clock.Ms - h.ReceivedMs < 10000;
+        string piSub = sn.Address + (fresh ? "  ·  " + h.LinkName : "");
+        if (sn.Online)
+        {
+            long power = fresh ? h.PowerFlags : -1;
+            double temp = fresh ? h.Num("temp") : double.NaN;
+            if (power > 0 && (power & 0x1) != 0) tilePi.Set("Low power!", piSub + "  ·  see the Pi tab", Pal.Bad);
+            else if (temp >= 80) tilePi.Set("Too hot", piSub + "  ·  " + temp.ToString("0") + " °C", Pal.Warn);
+            else tilePi.Set("Online", piSub, Pal.Good);
+        }
         else if (sn.Address.Length == 0) tilePi.Set("Looking up…", sn.Host, Pal.Warn);
         else tilePi.Set("No reply", sn.Address, Pal.Bad);
 
@@ -1103,6 +1399,7 @@ class MainForm : Form
             if (lblDetails.Text != details) lblDetails.Text = details;
             string slots = "Connected now: " + (sn.Slots == "none" ? "none" : "slot " + sn.Slots.Replace(",", ", "));
             if (lblSlots.Text != slots) lblSlots.Text = slots;
+            UpdatePiTab(sn);
             UpdateTray(sn);
         }
 
@@ -1143,7 +1440,11 @@ class MainForm : Form
                    (KeyboardHook.LastInjected ? "sent by a program (Parsec)" : "typed on this PC") + ", " + Ago(ago);
         lines.Add(key);
         lines.Add("Network:  " + sn.SentPerSec + " packets/s to the Pi, " + sn.RepliesPerSec + "/s answers back");
-        lines.Add("Pi:  " + sn.LinkText);
+        var h = sn.Health;
+        string pi = "Pi:  " + sn.LinkText;
+        if (h != null && Clock.Ms - h.ReceivedMs < 10000)
+            pi += ", " + h["link_text"] + (h["temp"].Length > 0 ? ", CPU " + h["temp"] + " °C" : "");
+        lines.Add(pi);
         return string.Join("\n\n", lines.ToArray());
     }
 
@@ -1245,7 +1546,9 @@ class MainForm : Form
     protected override void OnActivated(EventArgs e)
     {
         base.OnActivated(e);
-        KeyboardHook.Paused = txtPi != null && txtPi.Focused; // also called while the window is still being built
+        // (also called while the window is still being built)
+        var a = ActiveControl;
+        KeyboardHook.Paused = a != null && (pauseControls.Contains(a) || pauseControls.Contains(a.Parent));
     }
 
     protected override void OnDeactivate(EventArgs e)

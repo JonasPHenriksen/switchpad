@@ -15,8 +15,9 @@ Switch HDMI -> capture card -> PC -> Parsec
   sticks, no motion controls, rumble or amiibo.
 - The Pi software installs itself on first boot. No keyboard or monitor is needed.
 - The PC side is `SwitchPad.exe`: a window (and tray icon) with live status (Pi, Switch,
-  ping graph, a picture of what the Switch receives), a click-to-assign keyboard mapping and
-  settings. `SwitchPadBridge.exe` is the same as a console program. Both are built with the
+  ping graph, a picture of what the Switch receives), a click-to-assign keyboard mapping,
+  the Pi's health (temperature, power, Ethernet / Wi-Fi link, USB) with buttons to
+  self-test, restart, reboot, update it or collect its logs, and settings. `SwitchPadBridge.exe` is the same as a console program. Both are built with the
   C# compiler that ships with Windows. Nothing to install.
 - Both sides log everything (connection hiccups, lost packets, round-trip time), and
   `collect-logs.cmd` packs it into one zip.

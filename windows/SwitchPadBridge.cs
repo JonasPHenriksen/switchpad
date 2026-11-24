@@ -900,6 +900,7 @@ class Settings
     public bool RemoteKeysOnly = false;  // only injected keys (e.g. from Parsec) count
     public int WalkPercent = 50;
     public bool StartMinimized = false;
+    public string PiUser = "";           // SSH user on the Pi, for Collect logs / Update Pi
     public Dictionary<string, int[]> KeyMap = Targets.DefaultMap();
 
     public static string FilePath { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.ini"); } }
@@ -989,6 +990,7 @@ class Settings
             case "remote_keys_only": RemoteKeysOnly = Bool(v); break;
             case "walk_percent": WalkPercent = Int(v, 10, 100); break;
             case "start_minimized": StartMinimized = Bool(v); break;
+            case "pi_user": PiUser = v; break;
             default: throw new FormatException();
         }
     }
@@ -1022,6 +1024,7 @@ class Settings
         sb.AppendLine("remote_keys_only=" + OnOff(RemoteKeysOnly));
         sb.AppendLine("walk_percent=" + WalkPercent);
         sb.AppendLine("start_minimized=" + OnOff(StartMinimized));
+        sb.AppendLine("pi_user=" + PiUser);
         sb.AppendLine();
         sb.AppendLine("[keys]");
         sb.AppendLine("# Switch input = up to 2 Windows key names, e.g. W, Space, LShiftKey, D1 (the 1 key), NumPad8, Up");
@@ -1041,6 +1044,76 @@ class Settings
 
 // ------------------------------------------------------------------ network (UDP) link to the Pi
 
+// Pi -> PC health, every 2 s: "SWH1" + UTF-8 "key=value" lines (health_msg in switchpad.py).
+// Older Pi software doesn't send it.
+class PiHealth
+{
+    public readonly Dictionary<string, string> Values = new Dictionary<string, string>();
+    public double ReceivedMs;
+
+    public static PiHealth Parse(byte[] d, int offset)
+    {
+        var h = new PiHealth();
+        h.ReceivedMs = Clock.Ms;
+        string text = Encoding.UTF8.GetString(d, offset, d.Length - offset);
+        foreach (string line in text.Split('\n'))
+        {
+            int eq = line.IndexOf('=');
+            if (eq > 0) h.Values[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+        }
+        return h;
+    }
+
+    public string this[string key] { get { string v; return Values.TryGetValue(key, out v) ? v : ""; } }
+
+    public double Num(string key)
+    {
+        double v;
+        return double.TryParse(this[key], NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : double.NaN;
+    }
+
+    // get_throttled bits, or -1 if unknown.
+    public long PowerFlags
+    {
+        get
+        {
+            string s = this["power"];
+            if (s.StartsWith("0x")) s = s.Substring(2);
+            long v;
+            return long.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v) ? v : -1;
+        }
+    }
+
+    public string LinkName
+    {
+        get
+        {
+            switch (this["link"])
+            {
+                case "ethernet": return "Ethernet";
+                case "wifi": return "Wi-Fi";
+                case "none": return "no network";
+                default: return this["link"];
+            }
+        }
+    }
+
+    public string Summary()
+    {
+        return string.Format("{0}, SwitchPad {1}, {2}, CPU {3} C, power {4}, USB {5}",
+            this["model"], this["sw"], this["link_text"], this["temp"].Length > 0 ? this["temp"] : "?",
+            this["power_text"], this["usb"]);
+    }
+}
+
+// The Pi's answer to a command from the PC ("SWR1" + nonce + text). A command can get more than
+// one answer: the self-test answers "ok" at once and "done" when it has finished.
+class CommandReply
+{
+    public string Command, Text;
+    public bool IsError { get { return Text.StartsWith("error"); } }
+}
+
 class UdpLink
 {
     readonly UdpClient udp;
@@ -1055,8 +1128,26 @@ class UdpLink
     long lastStatusMs = -100000; // Clock.Ms when the Pi last answered
     long discoverUntilMs = -1;
     string found;
+    volatile PiHealth health;
     readonly LinkStats stats = new LinkStats();
     public LinkStats Stats { get { return stats; } }
+    public PiHealth Health { get { return health; } }
+
+    // Commands to the Pi: resent until the Pi answers (UDP can drop a packet), then kept a
+    // while so later answers (the self-test's "done") can be matched to them.
+    class PendingCommand
+    {
+        public uint Nonce;
+        public string Command;
+        public double FirstMs, SentMs;
+        public int Tries;
+        public bool Answered;
+        public readonly List<string> Seen = new List<string>(); // answers already passed on
+    }
+    readonly object cmdGate = new object();
+    readonly List<PendingCommand> pending = new List<PendingCommand>();
+    readonly List<CommandReply> replies = new List<CommandReply>();
+    uint nextNonce = (uint)Environment.TickCount;
 
     public UdpLink(string host, int port)
     {
@@ -1086,6 +1177,7 @@ class UdpLink
             target = IPAddress.TryParse(h, out ip) ? new IPEndPoint(ip, port) : null;
             Interlocked.Exchange(ref lastStatusMs, -100000);
             stats.Rtt.Reset();
+            health = null;
         }
         lookupNow.Set();
     }
@@ -1213,18 +1305,27 @@ class UdpLink
         return list;
     }
 
+    static bool Magic(byte[] d, string m)
+    {
+        return d.Length >= 4 && d[0] == m[0] && d[1] == m[1] && d[2] == m[2] && d[3] == m[3];
+    }
+
     public void Poll()
     {
         while (udp.Available > 0)
         {
             IPEndPoint from = null;
             byte[] d;
-            try { d = udp.Receive(ref from); } catch (SocketException) { return; }
-            if (d.Length < 8 || !StatusMsg.IsMagic(d, 0) || d.Length < StatusMsg.Length(d, 0)) continue;
+            try { d = udp.Receive(ref from); } catch (SocketException) { break; }
+            if (d.Length < 8) continue;
+            bool isStatus = StatusMsg.IsMagic(d, 0), isHealth = Magic(d, "SWH1"), isReply = Magic(d, "SWR1");
+            if (!isStatus && !isHealth && !isReply) continue;
+            if (isStatus && d.Length < StatusMsg.Length(d, 0)) continue;
             var t = target;
             if (t == null || !from.Address.Equals(t.Address))
             {
-                if (Clock.Ms >= Interlocked.Read(ref discoverUntilMs)) continue; // not from our Pi
+                // not from our Pi (unless "Find Pi" is asking around)
+                if (!isStatus || Clock.Ms >= Interlocked.Read(ref discoverUntilMs)) continue;
                 string addr = from.Address.ToString();
                 lock (gate)
                 {
@@ -1236,8 +1337,96 @@ class UdpLink
                 Interlocked.Exchange(ref found, addr);
                 Log.Write("Find Pi: the Pi answered from " + addr);
             }
+            if (isHealth) { health = PiHealth.Parse(d, 4); continue; }
+            if (isReply) { GotReply(BitConverter.ToUInt32(d, 4), Encoding.UTF8.GetString(d, 8, d.Length - 8)); continue; }
             Interlocked.Exchange(ref lastStatusMs, (long)Clock.Ms);
             attached = StatusMsg.Read(d, 0, stats);
+        }
+        ServiceCommands();
+    }
+
+    // Sends a command ("selftest", "restart", "reboot", "ping"); answers come from TakeReplies().
+    public void SendCommand(string command)
+    {
+        var p = new PendingCommand { Command = command, FirstMs = Clock.Ms, SentMs = Clock.Ms };
+        lock (cmdGate)
+        {
+            p.Nonce = nextNonce++;
+            pending.Add(p);
+        }
+        SendCommandPacket(p);
+    }
+
+    void SendCommandPacket(PendingCommand p)
+    {
+        var t = target;
+        p.SentMs = Clock.Ms;
+        p.Tries++;
+        if (t == null) return;
+        byte[] text = Encoding.UTF8.GetBytes(p.Command);
+        var pkt = new byte[8 + text.Length];
+        pkt[0] = (byte)'S'; pkt[1] = (byte)'W'; pkt[2] = (byte)'C'; pkt[3] = (byte)'1';
+        BitConverter.GetBytes(p.Nonce).CopyTo(pkt, 4);
+        text.CopyTo(pkt, 8);
+        try { udp.Send(pkt, pkt.Length, t); }
+        catch (SocketException e) { Log.Write("Network: sending the command failed (" + e.SocketErrorCode + ")"); }
+    }
+
+    void GotReply(uint nonce, string text)
+    {
+        lock (cmdGate)
+        {
+            string command = "?";
+            foreach (var p in pending)
+            {
+                if (p.Nonce != nonce) continue;
+                command = p.Command;
+                // the same answer again (a resend crossed the first answer): pass it on once
+                if (p.Seen.Contains(text)) return;
+                p.Seen.Add(text);
+                p.Answered = true;
+            }
+            replies.Add(new CommandReply { Command = command, Text = text });
+        }
+    }
+
+    void ServiceCommands()
+    {
+        var resend = new List<PendingCommand>();
+        lock (cmdGate)
+        {
+            double now = Clock.Ms;
+            for (int i = pending.Count - 1; i >= 0; i--)
+            {
+                var p = pending[i];
+                if (p.Answered)
+                {
+                    if (now - p.FirstMs > 60000) pending.RemoveAt(i);
+                }
+                else if (now - p.SentMs < 300) { }
+                else if (p.Tries < 4) resend.Add(p);
+                else
+                {
+                    pending.RemoveAt(i);
+                    replies.Add(new CommandReply
+                    {
+                        Command = p.Command,
+                        Text = "error: no answer from the Pi. Is it on? If it is, its SwitchPad is older " +
+                               "than this PC's and doesn't know commands yet: use Update Pi.",
+                    });
+                }
+            }
+        }
+        foreach (var p in resend) SendCommandPacket(p);
+    }
+
+    public List<CommandReply> TakeReplies()
+    {
+        lock (cmdGate)
+        {
+            var r = new List<CommandReply>(replies);
+            replies.Clear();
+            return r;
         }
     }
 }
@@ -1253,6 +1442,9 @@ class Snapshot
     public byte[] Current = Report.Neutral();
     public int PadSlot = -1, SentPerSec, RepliesPerSec;
     public double[] PingHistory = new double[0];
+    public PiHealth Health;              // null until the Pi sends one (older Pi software never does)
+    public double OnlineSinceMs = -1;    // Clock.Ms when the Pi started answering, -1 while it doesn't
+    public string[] CommandLines = new string[0]; // recent commands and the Pi's answers
 }
 
 class Engine
@@ -1288,6 +1480,27 @@ class Engine
     // 12 s of the scripted test pattern.
     public void StartTest() { testRequested = true; }
 
+    // A command for the Pi: "selftest", "restart", "reboot" or "ping".
+    public void Command(string command)
+    {
+        Log.Write("Command to the Pi: " + command);
+        AddCommandLine("→ " + command);
+        Link.SendCommand(command);
+    }
+
+    readonly List<string> commandLines = new List<string>();
+
+    void AddCommandLine(string text)
+    {
+        lock (commandLines)
+        {
+            commandLines.Add(DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "  " + text);
+            if (commandLines.Count > 8) commandLines.RemoveAt(0);
+        }
+    }
+
+    string[] CommandLinesCopy() { lock (commandLines) return commandLines.ToArray(); }
+
     public void Run()
     {
         var clock = Stopwatch.StartNew();
@@ -1306,6 +1519,9 @@ class Engine
         for (int i = 0; i < ping.Length; i++) ping[i] = -1;
         long sent0 = 0, rx0 = 0;
         int sentPerSec = 0, rxPerSec = 0;
+        double onlineSince = -1;
+        PiHealth lastHealth = null;
+        string healthKey = null;
 
         Settings c0 = Cfg;
         Log.Write(string.Format("Sending to the Pi at {0} ({1}, {2}, keyboard {3}, min interval {4} ms).{5}", c0.Pi,
@@ -1388,7 +1604,21 @@ class Engine
             if (Link.Online != wasOnline)
             {
                 wasOnline = Link.Online;
+                onlineSince = wasOnline ? Clock.Ms : -1;
                 Log.Write(wasOnline ? "Pi is answering (" + Link.Status + ")" : "Pi is NOT answering any more (" + Link.Status + ")");
+            }
+            var health = Link.Health;
+            if (health != null && health != lastHealth)
+            {
+                lastHealth = health;
+                // logged when something that matters changes (not every temperature wiggle)
+                string key = health["sw"] + "|" + health["link"] + "|" + health["dev"] + "|" + health["power"] + "|" + health["usb"];
+                if (key != healthKey) { healthKey = key; Log.Write("Pi health: " + health.Summary()); }
+            }
+            foreach (var r in Link.TakeReplies())
+            {
+                Log.Write("Pi answered '" + r.Command + "': " + r.Text);
+                AddCommandLine(r.Text);
             }
             if (wasOnline && Link.SwitchAttached != wasAttached)
             {
@@ -1403,11 +1633,14 @@ class Engine
                 Log.Write(string.Format(
                     "stats {0:0}s: {1} | Switch: {2} | pad slot {3} (slots {4}) | keyboard {5} | sent {6}, send errors {7}, " +
                     "changes {8} | status msgs from Pi {9} | round trip PC-Pi-PC {10} | max send {11} ms, slow sends {12} | " +
-                    "max loop {13} ms | holding: {14}",
+                    "max loop {13} ms | holding: {14} | Pi: {15}",
                     (now - lastStats) / 1000.0, Link.Status,
                     Link.Online ? (Link.SwitchAttached ? "connected" : "not connected") : "?",
                     pad, slots, cfg.Keyboard ? "on" : "off", s.Sent, s.SendErrors, changes, s.StatusRx,
-                    s.Rtt.TakeSummary(), maxSendMs, slowSends, maxLoopMs, Report.Describe(report)), false);
+                    s.Rtt.TakeSummary(), maxSendMs, slowSends, maxLoopMs, Report.Describe(report),
+                    health != null && Clock.Ms - health.ReceivedMs < 10000
+                        ? "cpu " + health["temp"] + " C, " + health["link_text"] + ", power " + health["power"]
+                        : "no health info"), false);
                 s.Sent = s.SendErrors = s.StatusRx = 0;
                 changes = slowSends = 0;
                 maxSendMs = maxLoopMs = 0;
@@ -1445,6 +1678,9 @@ class Engine
                     SentPerSec = sentPerSec,
                     RepliesPerSec = rxPerSec,
                     PingHistory = (double[])ping.Clone(),
+                    Health = health,
+                    OnlineSinceMs = onlineSince,
+                    CommandLines = CommandLinesCopy(),
                 };
             }
 
@@ -1475,7 +1711,7 @@ class Engine
 // Helpers shared by both programs.
 static class Bridge
 {
-    public const string Version = "2026-11-24 (window + keyboard)";
+    public const string Version = "2026-11-24b (window, keyboard, Pi health + controls)";
 
     // Only one SwitchPad.exe / SwitchPadBridge.exe at a time: two would fight over the controller.
     public static Mutex SingleInstance()

@@ -133,6 +133,7 @@ Delete that file to go back.
 - **Dashboard:** a controller picture of exactly what the Switch receives, the ping over
   the last minute, and details: the last key pressed and whether it came from Parsec.
 - **Keyboard:** the key mapping (below).
+- **Pi:** the Pi's health and buttons to test, restart or update it (below).
 - **Settings:** Pi address and **Find Pi**, controller slot, button layout, ZL/ZR trigger
   point, stick deadzone, startup, and the test pattern.
 - **Log:** everything that's also written to the log file.
@@ -142,6 +143,34 @@ Pi answering but the Switch isn't using the controller, **red** = no answer from
 
 **Startup:** under Settings, "Start SwitchPad when I sign in to Windows" starts it in the
 tray at every sign-in; "Start minimized to the tray" does that for manual starts too.
+
+### The Pi tab
+
+**Health**, sent by the Pi every 2 seconds:
+- model and SwitchPad version on the Pi,
+- **network**: Ethernet (with its speed) or Wi-Fi (with signal, speed and channel),
+- **CPU temperature** (amber from 70 °C, red from 80 °C, where the Pi slows itself down),
+- **power**: "UNDER-VOLTAGE NOW" in red means the power supply or cable is too weak, which
+  makes USB and the network unreliable. The Pi box at the top then also says **Low power!**,
+- **USB to the Switch**: in use, not connected, or suspended (Switch asleep),
+- how long the Pi and SwitchPad have been running, packets received / lost from the PC,
+  network gaps, failsafe releases and USB write errors since SwitchPad started.
+
+**Controls:**
+- **Run self-test:** the Pi plays the test pattern by itself for 12 s (L+R three times,
+  D-pad, stick circle) and reports whether the Switch took every report. It tests the Pi,
+  its cable and the dock without the network in between. Your input pauses meanwhile. Open
+  Controllers → Change Grip/Order on the Switch to watch it.
+- **Restart SwitchPad** (about 5 s) and **Reboot Pi** (about a minute) ask first.
+- **Collect logs…** and **Update Pi…** open a window running `collect-logs.cmd` /
+  `update-pi.cmd` for you (see below). They work over SSH, so enter the **Pi user name**
+  (the one chosen in Raspberry Pi Imager) and type the Pi's password in that window.
+
+The health information and the first three buttons need the Pi to run SwitchPad from
+2026-11-24 or newer. With an older one, the tab says so: use **Update Pi…** once.
+The Pi takes these commands only from the PC that is sending it input. That is the same
+trust as the controller input itself: something on your home network that could press
+buttons could also restart the Pi.
 
 ### Button mapping (default: same position)
 
@@ -232,8 +261,9 @@ audio/video output, not a power input.
 - **The Pi runs only while the dock powers it.** When the Switch goes to sleep or is taken
   out of the dock, the dock may cut power to its USB ports. The Pi then switches off and
   needs about 30 s to start again once power is back.
-- **Labels:** the Pi's log shows `wifi NOT CONNECTED`. That's normal on a cable and
-  doesn't matter.
+- **Network:** the Pi tab and the Pi's log say which connection is in use, e.g.
+  `Ethernet 1000 Mbit/s, full duplex`. (Pi software before 2026-11-24 logged
+  `wifi NOT CONNECTED` on a cable; that was only a wrong label.)
 - **If the PC shows Switch: Not connected:** check that the cable carries data, that it's
   in the Pi's USB-C port, and that the Switch is docked and awake. To rule out the dock,
   connect the Pi's USB-C port to the PC and open `joy.cpl` (step 5): if **POKKEN
@@ -270,7 +300,8 @@ Both sides log everything automatically:
   power problems (under-voltage), and a stats line every 10 s. `pi delay` there is how
   long an input waits on the Pi before the Switch takes it.
 
-To send them, play until the problem happens, then run (SwitchPad can keep running):
+To send them, play until the problem happens, then click **Collect logs…** on the Pi tab,
+or run this yourself (SwitchPad can keep running):
 ```
 windows\collect-logs.cmd USER@<Pi's IP>
 ```
@@ -290,11 +321,12 @@ If you connect by IP address, also run it with the IP (e.g. `ssh-keygen -R 192.1
 
 ## Updating the Pi (no re-flash)
 
-**Over SSH** (Pi running and on the network):
+**Over SSH** (Pi running and on the network): click **Update Pi…** on the Pi tab, or run
 ```
 windows\update-pi.cmd USER@<Pi's IP>
 ```
-It copies the new files, re-runs the install and restarts the bridge.
+It copies the new files, re-runs the install and restarts the bridge. Afterwards the Pi tab
+shows the new version under "SwitchPad on the Pi".
 
 **Without SSH:** shut the Pi down by unplugging it, put the SD card in the PC, and
 double-click `windows\prepare-sd.cmd` again. A card installed with the current version only
@@ -309,6 +341,8 @@ about 3 minutes.
 | Pi: **Looking up…** | The name lookup is slow or failing. Click **Find Pi**, or enter the Pi's IP address (step 4). |
 | Pi: **No reply** | The Pi is off, still booting, or not on the same network. |
 | Switch: **Not connected** | Check the cable is in the Pi's **USB** port (Pi 4: the **USB-C** port), that it's a data cable, and that the Switch is docked and awake. |
+| Pi: **Low power!** | The Pi reports under-voltage right now: use a stronger power supply or a better cable. On a Pi 4 powered by the dock, try another dock USB port. |
+| Buttons do nothing in a game, but the Dashboard shows them | Run **Run self-test** on the Pi tab. If it says OK, the Pi ↔ Switch part works and the problem is between the PC and the Pi (see "Wi-Fi lag and hiccups"). |
 | "SwitchPad is already running" | Only one SwitchPad can run. Look for its tray icon (maybe under the ^ arrow next to the clock), or close `SwitchPadBridge.exe`. |
 | Keys don't do anything | Check **Use the keyboard**, and the "last key" line on the Dashboard. Windows doesn't show a program the keys typed into a window that runs **as administrator**: keep such a window out of focus, or run SwitchPad as administrator too. |
 
