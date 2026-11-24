@@ -12,6 +12,8 @@ $bridge = Get-ChildItem (Join-Path $here 'logs') -Filter 'bridge-*.log' -ErrorAc
           Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-3) }
 foreach ($f in $bridge) { Copy-Item $f.FullName $work }
 Write-Host "PC logs: $(@($bridge).Count) file(s)"
+$settings = Join-Path $here 'settings.ini'
+if (Test-Path $settings) { Copy-Item $settings $work; Write-Host "PC settings: settings.ini" }
 
 # 2. Basic PC info: XInput pads, the PC's Wi-Fi connection and hotspot, network adapters
 $pcInfo = Join-Path $work 'pc-info.txt'

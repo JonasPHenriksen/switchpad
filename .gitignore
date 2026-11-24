@@ -3,6 +3,10 @@
 
 # Build output: run windows\build.cmd to create it
 windows/SwitchPadBridge.exe
+windows/SwitchPad.exe
+
+# Each PC's own settings (Pi address, key mapping), written by SwitchPad.exe
+windows/settings.ini
 
 # Logs and log bundles
 windows/logs/

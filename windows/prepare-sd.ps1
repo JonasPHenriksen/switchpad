@@ -107,4 +107,4 @@ Write-Host "Done. Eject the card, put it in the Pi, connect HDMI and power it fr
 Write-Host "On the screen you'll see 'firstboot:' and '1/5 ... 5/5', 'INSTALL OK', then it reboots."
 Write-Host "(A freshly flashed card may reboot once more for its own first-boot setup.)"
 Write-Host "After that, lines starting with 'switchpad [' appear and the Pi is ready:"
-Write-Host "start SwitchPadBridge.exe on the PC."
+Write-Host "start SwitchPad.exe on the PC."

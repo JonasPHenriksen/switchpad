@@ -1,12 +1,20 @@
-// SwitchPadBridge - reads an XInput pad (e.g. Parsec's virtual Xbox pad) and streams it to the
-// SwitchPad Pi Zero W over Wi-Fi, which acts as a wired controller on the Switch.
+// SwitchPad bridge: reads an XInput pad (e.g. Parsec's virtual Xbox pad) and the keyboard, and
+// streams them over the network to the SwitchPad Pi, which acts as a wired controller on the Switch.
 // (Bluetooth was tried and dropped: on this hardware it kept disconnecting, and it wasn't
 // worth the effort to make it reliable.)
-// Build with build.cmd (uses the C# compiler that ships with Windows; nothing to install).
+//
+// build.cmd makes two programs from this file and SwitchPadGui.cs, with the C# compiler that
+// ships with Windows (nothing to install):
+//   SwitchPad.exe         window + tray icon: live status, keyboard mapping, settings
+//   SwitchPadBridge.exe   console version of the same engine (collect-logs uses its --list)
+// Both keep their settings in settings.ini and their logs in logs\ next to the exe.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
+using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -53,6 +61,27 @@ static class Native
 {
     [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint ms);
     [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint ms);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetProcessInformation(IntPtr process, int infoClass, ref PowerThrottlingState info, uint size);
+    [StructLayout(LayoutKind.Sequential)]
+    struct PowerThrottlingState { public uint Version, ControlMask, StateMask; }
+
+    // Windows 11 stops honouring timeBeginPeriod(1) for a program whose windows are minimized or
+    // covered (SwitchPad in the tray!), and may run it in "efficiency mode". Both would add up to
+    // ~16 ms of input lag. Opt out of both.
+    public static string KeepTimerPrecise()
+    {
+        try
+        {
+            // ControlMask: EXECUTION_SPEED (1) | IGNORE_TIMER_RESOLUTION (4); StateMask 0 = never throttle them.
+            var s = new PowerThrottlingState { Version = 1, ControlMask = 0x1 | 0x4, StateMask = 0 };
+            return SetProcessInformation(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, ref s, (uint)Marshal.SizeOf(s))
+                ? "ok" : "not available (error " + Marshal.GetLastWin32Error() + ")";
+        }
+        catch (EntryPointNotFoundException) { return "not available"; }
+    }
+
     [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
     [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr h, out uint mode);
     [DllImport("kernel32.dll")] static extern bool SetConsoleMode(IntPtr h, uint mode);
@@ -157,8 +186,8 @@ class Rtt
     readonly double[] sentAt = new double[1024];
     readonly uint[] sentSeq = new uint[1024];
     readonly object gate = new object();
-    double sum, max, smooth = -1;
-    int count;
+    double sum, max, smooth = -1, secSum;
+    int count, secCount;
 
     public void Sent(uint seq)
     {
@@ -174,6 +203,7 @@ class Rtt
             double rtt = Clock.Ms - sentAt[echo & 1023] - ageMs;
             if (rtt < 0 || rtt > 10000) return;
             sum += rtt; count++;
+            secSum += rtt; secCount++;
             if (rtt > max) max = rtt;
             smooth = smooth < 0 ? rtt : smooth * 0.8 + rtt * 0.2;
         }
@@ -182,59 +212,98 @@ class Rtt
     // Recent value for the status line, or -1 if none yet.
     public double Smooth { get { lock (gate) return smooth; } }
 
+    // Average since the last call (for the once-a-second ping graph), or -1 if no samples.
+    public double TakeSecond()
+    {
+        lock (gate)
+        {
+            double v = secCount == 0 ? -1 : secSum / secCount;
+            secSum = 0; secCount = 0;
+            return v;
+        }
+    }
+
     // "avg 6.1 max 14.0 ms (20)" for the stats line, then reset.
     public string TakeSummary()
     {
         lock (gate)
         {
             string s = count == 0 ? "no data" :
-                string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                string.Format(CultureInfo.InvariantCulture,
                     "avg {0:0.0} max {1:0.0} ms ({2} samples)", sum / count, max, count);
             sum = max = 0; count = 0;
             return s;
         }
     }
 
-    public void Reset() { lock (gate) smooth = -1; }
+    public void Reset() { lock (gate) { smooth = -1; secSum = 0; secCount = 0; } }
 }
 
-// Log file next to the exe (logs\bridge-<date>-<time>.log). Every event goes here and to the console.
+// Log file next to the exe (logs\bridge-<date>-<time>.log). Every event goes here, to the console
+// (console version) and to the last lines kept in memory for the Log tab (window version).
 static class Log
 {
     static readonly object gate = new object();
-    static System.IO.StreamWriter writer;
+    static StreamWriter writer;
     public static string FilePath = "(not open)";
+    public static bool ToConsole = true;
+    static readonly List<string> recent = new List<string>();
+    static long total; // lines written since start
+
+    public static string Dir { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs"); } }
 
     public static void Open()
     {
-        string dir = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
-        try { System.IO.Directory.CreateDirectory(dir); }
-        catch (Exception) { dir = System.IO.Path.GetTempPath(); }
-        FilePath = System.IO.Path.Combine(dir, "bridge-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
+        string dir = Dir;
+        try { Directory.CreateDirectory(dir); }
+        catch (Exception) { dir = Path.GetTempPath(); }
+        FilePath = Path.Combine(dir, "bridge-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
         try
         {
-            writer = new System.IO.StreamWriter(FilePath, true, new UTF8Encoding(false));
+            writer = new StreamWriter(FilePath, true, new UTF8Encoding(false));
             writer.AutoFlush = true;
         }
-        catch (Exception e) { Console.WriteLine("Could not open log file " + FilePath + ": " + e.Message); writer = null; }
+        catch (Exception e) { Write("Could not open log file " + FilePath + ": " + e.Message); writer = null; }
     }
 
     public static void Write(string msg) { Write(msg, true); }
 
     public static void Write(string msg, bool console)
     {
-        string line = DateTime.Now.ToString("HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture) + "  " + msg;
+        string line = DateTime.Now.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "  " + msg;
         lock (gate)
         {
             if (writer != null) { try { writer.WriteLine(line); } catch (Exception) { } }
+            recent.Add(line);
+            total++;
+            if (recent.Count > 2000) recent.RemoveRange(0, 500);
         }
-        if (console) Con.Line(line);
+        if (console && ToConsole) Con.Line(line);
+    }
+
+    // Lines written after `seen` (a count from an earlier call); updates `seen`.
+    public static List<string> Since(ref long seen)
+    {
+        lock (gate)
+        {
+            long first = total - recent.Count;
+            if (seen < first) seen = first;
+            int start = (int)(seen - first);
+            var result = recent.GetRange(start, recent.Count - start);
+            seen = total;
+            return result;
+        }
     }
 
     public static void Close() { lock (gate) { if (writer != null) { writer.Close(); writer = null; } } }
 }
 
-class LinkStats { public int Sent, SendErrors, StatusRx; public readonly Rtt Rtt = new Rtt(); }
+class LinkStats
+{
+    public int Sent, SendErrors, StatusRx;    // reset with every stats line
+    public long TotalSent, TotalStatusRx;     // never reset (per-second rates)
+    public readonly Rtt Rtt = new Rtt();
+}
 
 // Pi -> PC status: "SWS1" + attached(1) + version(1) + pad(2) [+ echo seq uint32 + age ms uint16 + pad(2)].
 // Version 0 (older Pi software) is 8 bytes, version 1 is 16 bytes.
@@ -251,6 +320,7 @@ static class StatusMsg
     public static bool Read(byte[] d, int i, LinkStats stats)
     {
         stats.StatusRx++;
+        stats.TotalStatusRx++;
         if (Length(d, i) == 16)
             stats.Rtt.Echo(BitConverter.ToUInt32(d, i + 8), BitConverter.ToUInt16(d, i + 12));
         return d[i + 4] == 1;
@@ -273,6 +343,11 @@ static class Report
     }
 
     public static byte[] Neutral() { return Make(0, HAT_CENTER, 128, 128, 128, 128); }
+
+    public static byte[] FromFrame(Frame f)
+    {
+        return Make(f.Buttons, Mapper.Hat(f.Up, f.Down, f.Left, f.Right), f.LX, f.LY, f.RX, f.RY);
+    }
 
     public static bool Same(byte[] a, byte[] b)
     {
@@ -303,10 +378,26 @@ static class Report
     }
 }
 
+// What the Switch should see right now, before it's packed into a report. The controller and
+// the keyboard both add to it.
+class Frame
+{
+    public int Buttons;
+    public bool Up, Down, Left, Right;
+    public byte LX = 128, LY = 128, RX = 128, RY = 128; // Switch convention: 0 = left/up, 255 = right/down
+
+    public void Clear()
+    {
+        Buttons = 0;
+        Up = Down = Left = Right = false;
+        LX = LY = RX = RY = 128;
+    }
+}
+
 static class Mapper
 {
     // positional = buttons keep their physical position (Xbox A, bottom -> Switch B, bottom).
-    public static byte[] Build(XInputState s, bool positional)
+    public static void FromXInput(XInputState s, Settings cfg, Frame f)
     {
         ushort x = s.Buttons;
         bool back = (x & XInput.BACK) != 0, start = (x & XInput.START) != 0;
@@ -320,7 +411,7 @@ static class Mapper
 
         int b = 0;
         bool xa = (x & XInput.A) != 0, xb = (x & XInput.B) != 0, xx = (x & XInput.X) != 0, xy = (x & XInput.Y) != 0;
-        if (positional)
+        if (cfg.Positional)
         {
             if (xa) b |= Report.B;
             if (xb) b |= Report.A;
@@ -336,17 +427,46 @@ static class Mapper
         }
         if ((x & XInput.LB) != 0) b |= Report.L;
         if ((x & XInput.RB) != 0) b |= Report.R;
-        if (s.LeftTrigger > 30) b |= Report.ZL;
-        if (s.RightTrigger > 30) b |= Report.ZR;
+        if (s.LeftTrigger > cfg.TriggerThreshold) b |= Report.ZL;
+        if (s.RightTrigger > cfg.TriggerThreshold) b |= Report.ZR;
         if (back) b |= Report.MINUS;
         if (start) b |= Report.PLUS;
         if ((x & XInput.LS) != 0) b |= Report.LCLICK;
         if (rs) b |= Report.RCLICK;
         if (home) b |= Report.HOME;
         if (capture) b |= Report.CAPTURE;
+        f.Buttons |= b;
 
-        int hat = Hat((x & XInput.UP) != 0, (x & XInput.DOWN) != 0, (x & XInput.LEFT) != 0, (x & XInput.RIGHT) != 0);
-        return Report.Make(b, hat, Axis(s.LX), InvAxis(s.LY), Axis(s.RX), InvAxis(s.RY));
+        f.Up |= (x & XInput.UP) != 0;
+        f.Down |= (x & XInput.DOWN) != 0;
+        f.Left |= (x & XInput.LEFT) != 0;
+        f.Right |= (x & XInput.RIGHT) != 0;
+        Stick(s.LX, s.LY, cfg.Deadzone, out f.LX, out f.LY);
+        Stick(s.RX, s.RY, cfg.Deadzone, out f.RX, out f.RY);
+    }
+
+    // XInput: Y up = +. Switch: Y down = +. deadzone in percent of full travel (0 = off).
+    static void Stick(short x, short y, int deadzone, out byte bx, out byte by)
+    {
+        if (deadzone <= 0)
+        {
+            bx = (byte)((x + 32768) >> 8);
+            by = (byte)(255 - ((y + 32768) >> 8));
+            return;
+        }
+        double fx = Math.Max(-1.0, x / 32767.0), fy = Math.Max(-1.0, y / 32767.0);
+        double mag = Math.Sqrt(fx * fx + fy * fy), dz = deadzone / 100.0;
+        if (mag <= dz) { bx = by = 128; return; }
+        double scale = Math.Min(1.0, (mag - dz) / (1 - dz)) / mag;
+        bx = ToByte(fx * scale);
+        by = ToByte(-fy * scale);
+    }
+
+    // -1..1 -> 1..255 (128 = centre)
+    public static byte ToByte(double v)
+    {
+        int b = (int)Math.Round(128 + v * 127);
+        return (byte)Math.Max(0, Math.Min(255, b));
     }
 
     public static int Hat(bool up, bool down, bool left, bool right)
@@ -359,9 +479,6 @@ static class Mapper
         if (left) return 6;
         return Report.HAT_CENTER;
     }
-
-    static byte Axis(short v) { return (byte)((v + 32768) >> 8); }
-    static byte InvAxis(short v) { return (byte)(255 - ((v + 32768) >> 8)); } // XInput Y up = +, Switch Y down = +
 }
 
 // Scripted input for testing without a gamepad. Avoids A so it can't launch anything.
@@ -389,38 +506,588 @@ static class TestScript
     }
 }
 
-// ------------------------------------------------------------------ Wi-Fi (UDP) link to the Pi
+// ------------------------------------------------------------------ keyboard
+
+// Everything a key can be mapped to.
+class Target
+{
+    public const int BUTTON = 0, DPAD = 1, LSTICK = 2, RSTICK = 3, WALK = 4;
+    public readonly string Id, Label;
+    public readonly int Kind, Value; // Value: button bit, or direction 0 up, 1 down, 2 left, 3 right
+
+    public Target(string id, string label, int kind, int value) { Id = id; Label = label; Kind = kind; Value = value; }
+}
+
+static class Targets
+{
+    public static readonly Target[] All =
+    {
+        new Target("A", "A", Target.BUTTON, Report.A),
+        new Target("B", "B", Target.BUTTON, Report.B),
+        new Target("X", "X", Target.BUTTON, Report.X),
+        new Target("Y", "Y", Target.BUTTON, Report.Y),
+        new Target("L", "L", Target.BUTTON, Report.L),
+        new Target("R", "R", Target.BUTTON, Report.R),
+        new Target("ZL", "ZL", Target.BUTTON, Report.ZL),
+        new Target("ZR", "ZR", Target.BUTTON, Report.ZR),
+        new Target("Plus", "+ (Plus)", Target.BUTTON, Report.PLUS),
+        new Target("Minus", "- (Minus)", Target.BUTTON, Report.MINUS),
+        new Target("Home", "Home", Target.BUTTON, Report.HOME),
+        new Target("Capture", "Capture", Target.BUTTON, Report.CAPTURE),
+        new Target("LS", "Left stick click", Target.BUTTON, Report.LCLICK),
+        new Target("RS", "Right stick click", Target.BUTTON, Report.RCLICK),
+        new Target("DUp", "D-pad up", Target.DPAD, 0),
+        new Target("DDown", "D-pad down", Target.DPAD, 1),
+        new Target("DLeft", "D-pad left", Target.DPAD, 2),
+        new Target("DRight", "D-pad right", Target.DPAD, 3),
+        new Target("LUp", "Left stick up", Target.LSTICK, 0),
+        new Target("LDown", "Left stick down", Target.LSTICK, 1),
+        new Target("LLeft", "Left stick left", Target.LSTICK, 2),
+        new Target("LRight", "Left stick right", Target.LSTICK, 3),
+        new Target("RUp", "Right stick up", Target.RSTICK, 0),
+        new Target("RDown", "Right stick down", Target.RSTICK, 1),
+        new Target("RLeft", "Right stick left", Target.RSTICK, 2),
+        new Target("RRight", "Right stick right", Target.RSTICK, 3),
+        new Target("Walk", "Walk (sticks tilt less while held)", Target.WALK, 0),
+    };
+
+    public static Target Find(string id)
+    {
+        foreach (var t in All) if (t.Id == id) return t;
+        return null;
+    }
+
+    public static Dictionary<string, int[]> EmptyMap()
+    {
+        var m = new Dictionary<string, int[]>();
+        foreach (var t in All) m[t.Id] = new int[2];
+        return m;
+    }
+
+    // Windows virtual-key codes.
+    public static Dictionary<string, int[]> DefaultMap()
+    {
+        var m = EmptyMap();
+        m["LUp"][0] = 0x57; m["LDown"][0] = 0x53; m["LLeft"][0] = 0x41; m["LRight"][0] = 0x44; // W S A D
+        m["RUp"][0] = 0x26; m["RDown"][0] = 0x28; m["RLeft"][0] = 0x25; m["RRight"][0] = 0x27; // arrow keys
+        m["B"][0] = 0x4A; m["A"][0] = 0x4B; m["Y"][0] = 0x55; m["X"][0] = 0x49;                 // J K U I
+        m["L"][0] = 0x51; m["R"][0] = 0x45; m["ZL"][0] = 0x31; m["ZR"][0] = 0x33;               // Q E 1 3
+        m["Plus"][0] = 0x0D; m["Minus"][0] = 0x08;                                              // Enter, Backspace
+        m["Home"][0] = 0x48; m["Capture"][0] = 0x7B;                                            // H, F12
+        m["LS"][0] = 0x43; m["RS"][0] = 0x4F;                                                   // C, O
+        m["DUp"][0] = 0x68; m["DDown"][0] = 0x62; m["DLeft"][0] = 0x64; m["DRight"][0] = 0x66; // numpad 8 2 4 6
+        m["Walk"][0] = 0xA0;                                                                    // left Shift
+        return m;
+    }
+}
+
+static class KeyNames
+{
+    [DllImport("user32.dll")] static extern uint MapVirtualKey(uint code, uint mapType);
+
+    // Name stored in settings.ini (the Windows Forms key name, e.g. "W", "D1", "LShiftKey").
+    public static string Name(int vk)
+    {
+        var k = (System.Windows.Forms.Keys)vk;
+        return Enum.IsDefined(typeof(System.Windows.Forms.Keys), k) ? k.ToString() : "VK" + vk.ToString("X2");
+    }
+
+    public static int Parse(string s)
+    {
+        s = s.Trim();
+        if (s.Length == 0) return 0;
+        int vk;
+        if (s.StartsWith("VK", StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(s.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out vk) && vk > 0 && vk < 256)
+            return vk;
+        System.Windows.Forms.Keys k;
+        if (Enum.TryParse(s, true, out k) && ((int)k & ~0xFF) == 0 && (int)k != 0) return (int)k;
+        throw new FormatException("unknown key '" + s + "'");
+    }
+
+    // Name for people, e.g. "Left Shift", "Num 8", "." (the character on this keyboard layout).
+    public static string Pretty(int vk)
+    {
+        if (vk >= 0x30 && vk <= 0x39) return ((char)vk).ToString();
+        if (vk >= 0x41 && vk <= 0x5A) return ((char)vk).ToString();
+        if (vk >= 0x60 && vk <= 0x69) return "Num " + (vk - 0x60);
+        if (vk >= 0x70 && vk <= 0x87) return "F" + (vk - 0x6F);
+        switch (vk)
+        {
+            case 0x08: return "Backspace";
+            case 0x09: return "Tab";
+            case 0x0D: return "Enter";
+            case 0x10: return "Shift";
+            case 0x11: return "Ctrl";
+            case 0x12: return "Alt";
+            case 0x13: return "Pause";
+            case 0x14: return "Caps Lock";
+            case 0x1B: return "Esc";
+            case 0x20: return "Space";
+            case 0x21: return "Page Up";
+            case 0x22: return "Page Down";
+            case 0x23: return "End";
+            case 0x24: return "Home key";
+            case 0x25: return "Left";
+            case 0x26: return "Up";
+            case 0x27: return "Right";
+            case 0x28: return "Down";
+            case 0x2C: return "Print Screen";
+            case 0x2D: return "Insert";
+            case 0x2E: return "Delete";
+            case 0x5B: return "Left Win";
+            case 0x5C: return "Right Win";
+            case 0x5D: return "Menu";
+            case 0x6A: return "Num *";
+            case 0x6B: return "Num +";
+            case 0x6D: return "Num -";
+            case 0x6E: return "Num .";
+            case 0x6F: return "Num /";
+            case 0x90: return "Num Lock";
+            case 0x91: return "Scroll Lock";
+            case 0xA0: return "Left Shift";
+            case 0xA1: return "Right Shift";
+            case 0xA2: return "Left Ctrl";
+            case 0xA3: return "Right Ctrl";
+            case 0xA4: return "Left Alt";
+            case 0xA5: return "Right Alt";
+        }
+        if (vk >= 0xBA && vk <= 0xE2) // punctuation: depends on the keyboard layout
+        {
+            try
+            {
+                uint c = MapVirtualKey((uint)vk, 2) & 0x7FFF; // MAPVK_VK_TO_CHAR
+                if (c > ' ') return ((char)c).ToString();
+            }
+            catch (Exception) { }
+        }
+        return Name(vk);
+    }
+
+    // Very short name for the controller picture.
+    public static string Short(int vk)
+    {
+        switch (vk)
+        {
+            case 0x25: return "←";
+            case 0x26: return "↑";
+            case 0x27: return "→";
+            case 0x28: return "↓";
+            case 0x08: return "Bksp";
+            case 0x0D: return "Enter";
+            case 0x14: return "Caps";
+            case 0x20: return "Space";
+            case 0x21: return "PgUp";
+            case 0x22: return "PgDn";
+            case 0x2D: return "Ins";
+            case 0x2E: return "Del";
+            case 0xA0: return "LShift";
+            case 0xA1: return "RShift";
+            case 0xA2: return "LCtrl";
+            case 0xA3: return "RCtrl";
+            case 0xA4: return "LAlt";
+            case 0xA5: return "RAlt";
+        }
+        if (vk >= 0x60 && vk <= 0x69) return "N" + (vk - 0x60);
+        return Pretty(vk);
+    }
+
+    public static string ToText(int[] keys)
+    {
+        var parts = new List<string>();
+        foreach (int k in keys) if (k != 0) parts.Add(Name(k));
+        return string.Join(", ", parts.ToArray());
+    }
+
+    public static string ListPretty(int[] keys)
+    {
+        var parts = new List<string>();
+        foreach (int k in keys) if (k != 0) parts.Add(Pretty(k));
+        return string.Join(", ", parts.ToArray());
+    }
+}
+
+// Reads the keyboard system-wide with a low-level keyboard hook, so keys from a Parsec guest work
+// whichever window has focus on this PC. The hook runs on its own thread with its own message
+// loop: Windows silently removes a hook whose thread is too slow to answer.
+static class KeyboardHook
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public int x, y; }
+    delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern IntPtr SetWindowsHookEx(int idHook, HookProc fn, IntPtr hMod, uint threadId);
+    [DllImport("user32.dll")]
+    static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    static extern int GetMessage(out MSG msg, IntPtr hwnd, uint min, uint max);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr GetModuleHandle(string name);
+
+    class Config { public bool Enabled, Block, RemoteOnly; public readonly bool[] Mapped = new bool[256]; }
+
+    static readonly bool[] down = new bool[256];
+    static readonly bool[] blocked = new bool[256];   // we swallowed this key's press: swallow its release too
+    static readonly bool[] swallowUp = new bool[256]; // the press was used to assign a key
+    static volatile Config cfg = new Config();
+    static volatile Action<int> capture;
+    static HookProc proc; // kept referenced so the garbage collector can't free it
+    static IntPtr hook;
+    static long lastKeyMs = -100000;
+
+    public static volatile bool Running;
+#pragma warning disable 649 // set by the window program only
+    public static volatile bool Paused;        // the window's text box has focus: keys are typing, not playing
+#pragma warning restore 649
+    public static volatile int LastVk;
+    public static volatile bool LastInjected;  // sent by a program (e.g. Parsec), not typed on this PC
+    public static double LastKeyMs { get { return Interlocked.Read(ref lastKeyMs); } }
+
+    public static void Start()
+    {
+        if (Running) return;
+        var t = new Thread(() =>
+        {
+            proc = Proc;
+            hook = SetWindowsHookEx(13 /* WH_KEYBOARD_LL */, proc, GetModuleHandle(null), 0);
+            if (hook == IntPtr.Zero)
+            {
+                Log.Write("Keyboard: could not install the keyboard hook (error " + Marshal.GetLastWin32Error() + "); keys won't work");
+                return;
+            }
+            Running = true;
+            MSG m;
+            while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { }
+        });
+        t.IsBackground = true;
+        t.Name = "keyboard hook";
+        t.Priority = ThreadPriority.AboveNormal;
+        t.Start();
+    }
+
+    public static void SetConfig(Settings s)
+    {
+        var c = new Config { Enabled = s.Keyboard, Block = s.BlockKeys, RemoteOnly = s.RemoteKeysOnly };
+        foreach (var kv in s.KeyMap)
+            foreach (int vk in kv.Value)
+                if (vk > 0 && vk < 256) c.Mapped[vk] = true;
+        cfg = c;
+        ReleaseAll();
+    }
+
+    public static bool IsDown(int vk) { return vk > 0 && vk < 256 && down[vk]; }
+
+    // Forget held keys (settings changed, screen locked): a key held now has to be pressed again.
+    public static void ReleaseAll() { for (int i = 0; i < 256; i++) down[i] = false; }
+
+    // The next key pressed anywhere goes to `onKey` (and nowhere else) instead of the Switch.
+    public static void BeginCapture(Action<int> onKey) { capture = onKey; }
+    public static void CancelCapture() { capture = null; }
+
+    static IntPtr Proc(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            try
+            {
+                var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                int vk = (int)(k.vkCode & 0xFF);
+                int msg = wParam.ToInt32();
+                bool isDown = msg == 0x100 || msg == 0x104; // WM_KEYDOWN, WM_SYSKEYDOWN
+                bool injected = (k.flags & 0x10) != 0;      // LLKHF_INJECTED
+                if (isDown)
+                {
+                    LastVk = vk;
+                    LastInjected = injected;
+                    Interlocked.Exchange(ref lastKeyMs, (long)Clock.Ms);
+                }
+
+                var cap = capture;
+                if (isDown && cap != null)
+                {
+                    capture = null;
+                    swallowUp[vk] = true;
+                    down[vk] = false;
+                    cap(vk);
+                    return (IntPtr)1;
+                }
+                if (!isDown && swallowUp[vk]) { swallowUp[vk] = false; return (IntPtr)1; }
+
+                var c = cfg;
+                bool use = c.Enabled && !Paused && (!c.RemoteOnly || injected);
+                down[vk] = isDown && use;
+                if (isDown) blocked[vk] = use && c.Block && c.Mapped[vk];
+                if (blocked[vk])
+                {
+                    if (!isDown) blocked[vk] = false;
+                    return (IntPtr)1;
+                }
+            }
+            catch (Exception) { } // never let an exception escape into Windows
+        }
+        return CallNextHookEx(hook, nCode, wParam, lParam);
+    }
+}
+
+// Adds the held keys to a frame. Returns true if any mapped key is held.
+static class KeyMapper
+{
+    public static bool Apply(Frame f, Settings cfg)
+    {
+        bool any = false, walk = false;
+        int lx = 0, ly = 0, rx = 0, ry = 0; // y: up = +
+        foreach (var t in Targets.All)
+        {
+            int[] keys;
+            if (!cfg.KeyMap.TryGetValue(t.Id, out keys)) continue;
+            bool held = false;
+            foreach (int vk in keys) if (KeyboardHook.IsDown(vk)) held = true;
+            if (!held) continue;
+            any = true;
+            switch (t.Kind)
+            {
+                case Target.BUTTON: f.Buttons |= t.Value; break;
+                case Target.DPAD:
+                    if (t.Value == 0) f.Up = true;
+                    else if (t.Value == 1) f.Down = true;
+                    else if (t.Value == 2) f.Left = true;
+                    else f.Right = true;
+                    break;
+                case Target.LSTICK: Dir(t.Value, ref lx, ref ly); break;
+                case Target.RSTICK: Dir(t.Value, ref rx, ref ry); break;
+                case Target.WALK: walk = true; break;
+            }
+        }
+        double tilt = walk ? cfg.WalkPercent / 100.0 : 1.0;
+        Stick(lx, ly, tilt, ref f.LX, ref f.LY);
+        Stick(rx, ry, tilt, ref f.RX, ref f.RY);
+        return any;
+    }
+
+    static void Dir(int d, ref int x, ref int y)
+    {
+        if (d == 0) y++;
+        else if (d == 1) y--;
+        else if (d == 2) x--;
+        else x++;
+    }
+
+    // Keys override the controller's stick while they're held. Diagonals stay on the circle.
+    static void Stick(int x, int y, double tilt, ref byte bx, ref byte by)
+    {
+        if (x == 0 && y == 0) return;
+        double m = tilt * (x != 0 && y != 0 ? 0.7071 : 1.0);
+        bx = Mapper.ToByte(x * m);
+        by = Mapper.ToByte(-y * m);
+    }
+}
+
+// ------------------------------------------------------------------ settings (settings.ini)
+
+class Settings
+{
+    public string Pi = "switchpad.local";
+    public int Pad = -1;                 // XInput slot, -1 = auto
+    public bool Positional = true;       // layout: true = position, false = label
+    public int TriggerThreshold = 30;    // LT/RT value (0-255) above which ZL/ZR count as pressed
+    public int Deadzone = 0;             // percent of stick travel ignored around the centre
+    public int Interval = 1;             // minimum ms between packets
+    public bool Keyboard = true;
+    public bool BlockKeys = false;       // mapped keys don't reach other programs
+    public bool RemoteKeysOnly = false;  // only injected keys (e.g. from Parsec) count
+    public int WalkPercent = 50;
+    public bool StartMinimized = false;
+    public Dictionary<string, int[]> KeyMap = Targets.DefaultMap();
+
+    public static string FilePath { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.ini"); } }
+
+    public Settings Clone()
+    {
+        var s = (Settings)MemberwiseClone();
+        s.KeyMap = new Dictionary<string, int[]>();
+        foreach (var kv in KeyMap) s.KeyMap[kv.Key] = (int[])kv.Value.Clone();
+        return s;
+    }
+
+    public int[] Keys(string id)
+    {
+        int[] k;
+        return KeyMap.TryGetValue(id, out k) ? k : new int[2];
+    }
+
+    public string Summary()
+    {
+        return string.Format("Pi {0}, pad {1}, layout {2}, ZL/ZR above {3}, deadzone {4}%, keyboard {5}",
+            Pi, Pad < 0 ? "auto" : Pad.ToString(), Positional ? "position" : "label", TriggerThreshold, Deadzone,
+            Keyboard ? string.Format("on (hide mapped keys {0}, remote keys only {1}, walk {2}%)",
+                OnOff(BlockKeys), OnOff(RemoteKeysOnly), WalkPercent) : "off");
+    }
+
+    static string OnOff(bool b) { return b ? "on" : "off"; }
+
+    static bool Bool(string v)
+    {
+        v = v.ToLowerInvariant();
+        if (v == "on" || v == "true" || v == "yes" || v == "1") return true;
+        if (v == "off" || v == "false" || v == "no" || v == "0") return false;
+        throw new FormatException();
+    }
+
+    static int Int(string v, int min, int max) { return Math.Max(min, Math.Min(max, int.Parse(v, CultureInfo.InvariantCulture))); }
+
+    public static Settings Load()
+    {
+        var s = new Settings();
+        string path = FilePath;
+        if (!File.Exists(path)) return s;
+        string[] lines;
+        try { lines = File.ReadAllLines(path); }
+        catch (Exception e) { Log.Write("Could not read " + path + ": " + e.Message + " (using defaults)"); return s; }
+        string section = "";
+        foreach (string raw in lines)
+        {
+            string line = raw.Trim();
+            if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
+            if (line[0] == '[')
+            {
+                section = line.Trim('[', ']').Trim().ToLowerInvariant();
+                if (section == "keys") s.KeyMap = Targets.EmptyMap();
+                continue;
+            }
+            int eq = line.IndexOf('=');
+            if (eq <= 0) continue;
+            string k = line.Substring(0, eq).Trim(), v = line.Substring(eq + 1).Trim();
+            try
+            {
+                if (section == "keys") s.SetKeys(k, v);
+                else s.Set(k.ToLowerInvariant(), v);
+            }
+            catch (Exception) { Log.Write("settings.ini: ignoring the line '" + line + "'"); }
+        }
+        return s;
+    }
+
+    void Set(string k, string v)
+    {
+        switch (k)
+        {
+            case "pi": if (v.Length > 0) Pi = v; break;
+            case "pad": Pad = v.ToLowerInvariant() == "auto" ? -1 : Int(v, 0, 3); break;
+            case "layout":
+                v = v.ToLowerInvariant();
+                if (v != "position" && v != "label") throw new FormatException();
+                Positional = v == "position";
+                break;
+            case "trigger_threshold": TriggerThreshold = Int(v, 1, 254); break;
+            case "deadzone": Deadzone = Int(v, 0, 50); break;
+            case "interval": Interval = Int(v, 0, 50); break;
+            case "keyboard": Keyboard = Bool(v); break;
+            case "block_keys": BlockKeys = Bool(v); break;
+            case "remote_keys_only": RemoteKeysOnly = Bool(v); break;
+            case "walk_percent": WalkPercent = Int(v, 10, 100); break;
+            case "start_minimized": StartMinimized = Bool(v); break;
+            default: throw new FormatException();
+        }
+    }
+
+    void SetKeys(string id, string v)
+    {
+        var t = Targets.Find(id);
+        if (t == null) throw new FormatException();
+        var keys = new int[2];
+        int n = 0;
+        foreach (string part in v.Split(','))
+        {
+            if (part.Trim().Length == 0) continue;
+            if (n < 2) keys[n++] = KeyNames.Parse(part);
+        }
+        KeyMap[t.Id] = keys;
+    }
+
+    public bool Save()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("# SwitchPad settings. Change them in SwitchPad.exe, or edit this file while SwitchPad is closed.");
+        sb.AppendLine("pi=" + Pi);
+        sb.AppendLine("pad=" + (Pad < 0 ? "auto" : Pad.ToString(CultureInfo.InvariantCulture)));
+        sb.AppendLine("layout=" + (Positional ? "position" : "label"));
+        sb.AppendLine("trigger_threshold=" + TriggerThreshold);
+        sb.AppendLine("deadzone=" + Deadzone);
+        sb.AppendLine("interval=" + Interval);
+        sb.AppendLine("keyboard=" + OnOff(Keyboard));
+        sb.AppendLine("block_keys=" + OnOff(BlockKeys));
+        sb.AppendLine("remote_keys_only=" + OnOff(RemoteKeysOnly));
+        sb.AppendLine("walk_percent=" + WalkPercent);
+        sb.AppendLine("start_minimized=" + OnOff(StartMinimized));
+        sb.AppendLine();
+        sb.AppendLine("[keys]");
+        sb.AppendLine("# Switch input = up to 2 Windows key names, e.g. W, Space, LShiftKey, D1 (the 1 key), NumPad8, Up");
+        foreach (var t in Targets.All) sb.AppendLine(t.Id + "=" + KeyNames.ToText(Keys(t.Id)));
+        try
+        {
+            File.WriteAllText(FilePath, sb.ToString(), new UTF8Encoding(false));
+            return true;
+        }
+        catch (Exception e)
+        {
+            Log.Write("Could not save " + FilePath + ": " + e.Message);
+            return false;
+        }
+    }
+}
+
+// ------------------------------------------------------------------ network (UDP) link to the Pi
 
 class UdpLink
 {
     readonly UdpClient udp;
-    readonly string host;
     readonly int port;
+    readonly object gate = new object();
+    readonly AutoResetEvent lookupNow = new AutoResetEvent(false);
+    volatile string host;
     volatile IPEndPoint target;
-    uint seq;
+    volatile byte[] lastReport = Report.Neutral();
+    volatile bool attached, discoverHit;
+    int seq;
     long lastStatusMs = -100000; // Clock.Ms when the Pi last answered
-    bool attached;
+    long discoverUntilMs = -1;
+    string found;
     readonly LinkStats stats = new LinkStats();
     public LinkStats Stats { get { return stats; } }
 
     public UdpLink(string host, int port)
     {
-        this.host = host;
         this.port = port;
         udp = new UdpClient(0, AddressFamily.InterNetwork);
+        udp.EnableBroadcast = true; // for "Find Pi"
         // Ignore ICMP "port unreachable" (otherwise Receive throws WSAECONNRESET while the Pi boots).
         const int SIO_UDP_CONNRESET = -1744830452;
         udp.Client.IOControl(SIO_UDP_CONNRESET, new byte[] { 0 }, null);
-        IPAddress ip;
-        if (IPAddress.TryParse(host, out ip)) target = new IPEndPoint(ip, port);
-        else
+        SetHost(host);
+        // Looking up a name like switchpad.local can take 10+ s on Windows. Never do it in the
+        // sending loop: look it up in the background and keep using the last address meanwhile.
+        var t = new Thread(ResolveLoop);
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    public string Host { get { return host; } }
+    public string Address { get { var t = target; return t == null ? "" : t.Address.ToString(); } }
+
+    public void SetHost(string h)
+    {
+        lock (gate)
         {
-            // Looking up a name like switchpad.local can take 10+ s on Windows. Never do it in the
-            // sending loop: look it up in the background and keep using the last address meanwhile.
-            var t = new Thread(ResolveLoop);
-            t.IsBackground = true;
-            t.Start();
+            host = h;
+            IPAddress ip;
+            target = IPAddress.TryParse(h, out ip) ? new IPEndPoint(ip, port) : null;
+            Interlocked.Exchange(ref lastStatusMs, -100000);
+            stats.Rtt.Reset();
         }
+        lookupNow.Set();
     }
 
     double SinceStatusMs { get { return Clock.Ms - Interlocked.Read(ref lastStatusMs); } }
@@ -431,7 +1098,7 @@ class UdpLink
         get
         {
             var t = target;
-            return "Wi-Fi " + (Online ? "online (" + t.Address + ")" : t == null ? "looking up " + host + "..." : "no reply from " + t.Address);
+            return "Pi " + (Online ? "online (" + t.Address + ")" : t == null ? "looking up " + host + "..." : "no reply from " + t.Address);
         }
     }
 
@@ -440,48 +1107,110 @@ class UdpLink
         bool first = true;
         while (true)
         {
+            string h = host;
+            IPAddress literal;
             // Look up again only if the Pi has been silent for a while (its address may have changed).
-            if (target == null || SinceStatusMs > 5000)
+            if (!IPAddress.TryParse(h, out literal) && (target == null || SinceStatusMs > 5000))
             {
                 var t0 = Stopwatch.StartNew();
                 try
                 {
                     IPAddress ip = null;
-                    foreach (var a in Dns.GetHostAddresses(host))
+                    foreach (var a in Dns.GetHostAddresses(h))
                         if (a.AddressFamily == AddressFamily.InterNetwork) { ip = a; break; }
-                    if (ip == null) Log.Write("Wi-Fi: " + host + " has no IPv4 address");
-                    else if (target == null || !target.Address.Equals(ip))
+                    if (ip == null) Log.Write("Network: " + h + " has no IPv4 address");
+                    else
                     {
-                        Log.Write(string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                            "Wi-Fi: {0} is {1} (lookup took {2:0.0} s{3})", host, ip,
-                            t0.ElapsedMilliseconds / 1000.0,
-                            first ? "; to skip the lookup next time, start with --pi " + ip : ""));
-                        target = new IPEndPoint(ip, port);
-                        first = false;
+                        lock (gate)
+                        {
+                            if (host == h && (target == null || !target.Address.Equals(ip)))
+                            {
+                                Log.Write(string.Format(CultureInfo.InvariantCulture,
+                                    "Network: {0} is {1} (lookup took {2:0.0} s{3})", h, ip,
+                                    t0.ElapsedMilliseconds / 1000.0,
+                                    first ? "; use the IP address as the Pi address to skip the lookup" : ""));
+                                target = new IPEndPoint(ip, port);
+                                first = false;
+                            }
+                        }
                     }
                 }
                 catch (SocketException e)
                 {
-                    Log.Write("Wi-Fi: can't look up " + host + " (" + e.SocketErrorCode + ", after " +
+                    Log.Write("Network: can't look up " + h + " (" + e.SocketErrorCode + ", after " +
                               t0.ElapsedMilliseconds + " ms), retrying");
                 }
-                Thread.Sleep(5000);
+                lookupNow.WaitOne(5000);
             }
-            else Thread.Sleep(250);
+            else lookupNow.WaitOne(250);
         }
     }
 
     public void Send(byte[] report)
     {
+        lastReport = report;
         var t = target;
         if (t == null) return;
-        uint s = seq++;
+        SendTo(report, t);
+    }
+
+    void SendTo(byte[] report, IPEndPoint to)
+    {
+        uint s = (uint)(Interlocked.Increment(ref seq) - 1);
         var pkt = Report.Packet(s, report);
-        try { stats.Rtt.Sent(s); udp.Send(pkt, pkt.Length, t); stats.Sent++; }
+        try { stats.Rtt.Sent(s); udp.Send(pkt, pkt.Length, to); stats.Sent++; stats.TotalSent++; }
         catch (SocketException e)
         {
-            if (stats.SendErrors++ == 0) Log.Write("Wi-Fi: send failed (" + e.SocketErrorCode + ")");
+            if (stats.SendErrors++ == 0) Log.Write("Network: send failed to " + to.Address + " (" + e.SocketErrorCode + ")");
         }
+    }
+
+    // "Find Pi": for 3 s, send the current input to every local network's broadcast address.
+    // The Pi answers whoever sends it input, so its answer tells us its address.
+    public void Discover()
+    {
+        Interlocked.Exchange(ref discoverUntilMs, (long)Clock.Ms + 3000);
+        discoverHit = false;
+        Log.Write("Find Pi: asking every network this PC is on...");
+        var th = new Thread(() =>
+        {
+            var addrs = BroadcastAddresses();
+            while (Clock.Ms < Interlocked.Read(ref discoverUntilMs))
+            {
+                foreach (var a in addrs) SendTo(lastReport, new IPEndPoint(a, port));
+                Thread.Sleep(250);
+            }
+            if (!discoverHit) Log.Write("Find Pi: no answer (asked " + addrs.Count + " broadcast addresses)");
+        });
+        th.IsBackground = true;
+        th.Start();
+    }
+
+    // Address found by the last "Find Pi", once (null if none).
+    public string TakeFound() { return Interlocked.Exchange(ref found, null); }
+
+    static List<IPAddress> BroadcastAddresses()
+    {
+        var list = new List<IPAddress> { IPAddress.Broadcast };
+        try
+        {
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                {
+                    if (ua.Address.AddressFamily != AddressFamily.InterNetwork || ua.IPv4Mask == null) continue;
+                    byte[] ip = ua.Address.GetAddressBytes(), mask = ua.IPv4Mask.GetAddressBytes();
+                    if (mask[0] == 0) continue;
+                    var b = new byte[4];
+                    for (int i = 0; i < 4; i++) b[i] = (byte)(ip[i] | ~mask[i]);
+                    var addr = new IPAddress(b);
+                    if (!list.Contains(addr)) list.Add(addr);
+                }
+            }
+        }
+        catch (Exception e) { Log.Write("Find Pi: can't list network adapters: " + e.Message); }
+        return list;
     }
 
     public void Poll()
@@ -491,114 +1220,288 @@ class UdpLink
             IPEndPoint from = null;
             byte[] d;
             try { d = udp.Receive(ref from); } catch (SocketException) { return; }
-            if (d.Length >= 8 && StatusMsg.IsMagic(d, 0) && d.Length >= StatusMsg.Length(d, 0))
+            if (d.Length < 8 || !StatusMsg.IsMagic(d, 0) || d.Length < StatusMsg.Length(d, 0)) continue;
+            var t = target;
+            if (t == null || !from.Address.Equals(t.Address))
             {
-                Interlocked.Exchange(ref lastStatusMs, (long)Clock.Ms);
-                attached = StatusMsg.Read(d, 0, stats);
+                if (Clock.Ms >= Interlocked.Read(ref discoverUntilMs)) continue; // not from our Pi
+                string addr = from.Address.ToString();
+                lock (gate)
+                {
+                    host = addr;
+                    target = new IPEndPoint(from.Address, port);
+                }
+                discoverHit = true;
+                Interlocked.Exchange(ref discoverUntilMs, -1);
+                Interlocked.Exchange(ref found, addr);
+                Log.Write("Find Pi: the Pi answered from " + addr);
             }
+            Interlocked.Exchange(ref lastStatusMs, (long)Clock.Ms);
+            attached = StatusMsg.Read(d, 0, stats);
         }
     }
 }
 
-// ------------------------------------------------------------------ main
+// ------------------------------------------------------------------ engine (shared by both programs)
 
-static class Program
+// What the window shows. A new one is made ~30 times a second; never changed after that.
+class Snapshot
 {
-    static volatile bool stop;
+    public bool Online, Attached, Testing, Keyboard, KeyboardHeld;
+    public string LinkText = "", Host = "", Address = "", Slots = "none";
+    public double Ping = -1;
+    public byte[] Current = Report.Neutral();
+    public int PadSlot = -1, SentPerSec, RepliesPerSec;
+    public double[] PingHistory = new double[0];
+}
 
-    const string Usage =
-@"SwitchPadBridge - send an Xbox/XInput pad to the SwitchPad Pi (Nintendo Switch).
+class Engine
+{
+    public volatile Settings Cfg;
+    public volatile Snapshot Snap = new Snapshot();
+    public volatile bool StopRequested;
+    volatile bool testRequested;
+    public readonly UdpLink Link;
+#pragma warning disable 649 // set by the console program only
+    public bool ConsoleStatus, TestForever;
+    public int Seconds;
+#pragma warning restore 649
 
-Usage: SwitchPadBridge.exe [options]
-  --pi HOST       the Pi's IP address or name (default: switchpad.local).
-                  The IP address is faster, e.g. --pi 192.168.137.79
-  --pad N         XInput slot 0-3 to read (default: auto = highest connected slot)
-  --layout L      position (default): Xbox A/B/X/Y -> Switch B/A/Y/X (same physical spot)
-                  label: Xbox A/B/X/Y -> Switch A/B/X/Y (same letter)
-  --interval MS   minimum time between packets (default: 1)
-  --test          send a scripted test pattern instead of reading a pad
-  --list          list XInput pads, then exit
-  --seconds N     stop after N seconds (default: run until Ctrl+C)
-
-Extra buttons: Guide or Back+Start = HOME, Back + right-stick click = CAPTURE.";
-
-    static int Main(string[] args)
+    public Engine(Settings s)
     {
-        string pi = "switchpad.local";
-        int pad = -1, seconds = 0, interval = 1;
-        bool positional = true, test = false, list = false;
-        try
-        {
-            for (int i = 0; i < args.Length; i++)
-            {
-                switch (args[i].ToLowerInvariant())
-                {
-                    case "--pi": case "--wifi": pi = args[++i]; break; // --wifi: older name
-                    case "--pad": pad = int.Parse(args[++i]); if (pad < 0 || pad > 3) throw new FormatException(); break;
-                    case "--layout":
-                        string l = args[++i].ToLowerInvariant();
-                        if (l == "position") positional = true;
-                        else if (l == "label") positional = false;
-                        else throw new FormatException();
-                        break;
-                    case "--interval": interval = int.Parse(args[++i]); break;
-                    case "--test": test = true; break;
-                    case "--list": list = true; break;
-                    case "--seconds": seconds = int.Parse(args[++i]); break;
-                    default: throw new FormatException();
-                }
-            }
-        }
-        catch (Exception)
-        {
-            Console.WriteLine(Usage);
-            return 1;
-        }
-
-        if (list) { foreach (var l in DeviceLines()) Console.WriteLine(l); return 0; }
-
-        Native.DisableQuickEdit();
-        Con.Start();
-        Log.Open();
-        Log.Write("=== SwitchPadBridge " + Version + " started, log file: " + Log.FilePath);
-        Log.Write("Arguments: " + (args.Length == 0 ? "(none)" : string.Join(" ", args)) +
-                  " | Windows build " + WindowsBuild() + (Environment.Is64BitProcess ? " 64-bit" : " 32-bit"), false);
-        foreach (var l in DeviceLines()) Log.Write(l, false);
-        AppDomain.CurrentDomain.UnhandledException += (s, e) => Log.Write("CRASH (unhandled): " + e.ExceptionObject);
-
-        var link = new UdpLink(pi, 5005);
-
-        Console.CancelKeyPress += (s, e) => { e.Cancel = true; stop = true; };
-        Native.timeBeginPeriod(1);
-        try { Run(link, "the Pi at " + pi, pad, positional, test, seconds, interval); }
-        catch (Exception e) { Log.Write("CRASH: " + e); throw; }
-        finally
-        {
-            Native.timeEndPeriod(1);
-            Log.Write("=== Stopped. Log file: " + Log.FilePath);
-            Log.Close();
-            Con.Flush();
-            Console.WriteLine();
-        }
-        return 0;
+        Cfg = s;
+        KeyboardHook.SetConfig(s);
+        Link = new UdpLink(s.Pi, 5005);
     }
 
-    const string Version = "2026-11-20c (Wi-Fi only)";
+    // New settings from the window (it never changes an object it handed over).
+    public void Apply(Settings s)
+    {
+        Settings old = Cfg;
+        Cfg = s;
+        KeyboardHook.SetConfig(s);
+        if (s.Pi != Link.Host) Link.SetHost(s.Pi);
+        string summary = s.Summary();
+        if (summary != old.Summary()) Log.Write("Settings: " + summary);
+    }
 
-    static string WindowsBuild()
+    // 12 s of the scripted test pattern.
+    public void StartTest() { testRequested = true; }
+
+    public void Run()
+    {
+        var clock = Stopwatch.StartNew();
+        byte[] last = null;
+        long lastSend = -1000, lastPrint = -1000, lastScan = -1000, lastSlotScan = -1000, lastStats = 0, prevIter = 0;
+        long lastSecond = 0, lastSnap = -1000, testStart = -1, keyHeldAt = -100000;
+        int pad = -1, padSetting = -2;
+        string slots = "none", lastButtons = null;
+        bool wasOnline = false, wasAttached = false;
+        // stats, reset every 10 s
+        int changes = 0, slowSends = 0;
+        long maxSendMs = 0, maxLoopMs = 0;
+        var sendTimer = new Stopwatch();
+        var frame = new Frame();
+        var ping = new double[60];
+        for (int i = 0; i < ping.Length; i++) ping[i] = -1;
+        long sent0 = 0, rx0 = 0;
+        int sentPerSec = 0, rxPerSec = 0;
+
+        Settings c0 = Cfg;
+        Log.Write(string.Format("Sending to the Pi at {0} ({1}, {2}, keyboard {3}, min interval {4} ms).{5}", c0.Pi,
+            TestForever ? "TEST PATTERN" : "layout " + (c0.Positional ? "position" : "label"),
+            c0.Pad >= 0 ? "pad " + c0.Pad : "pad auto", c0.Keyboard ? "on" : "off", c0.Interval,
+            ConsoleStatus ? " Ctrl+C to quit." : ""));
+
+        while (!StopRequested && (Seconds <= 0 || clock.ElapsedMilliseconds < Seconds * 1000L))
+        {
+            long now = clock.ElapsedMilliseconds;
+            maxLoopMs = Math.Max(maxLoopMs, now - prevIter);
+            prevIter = now;
+            Settings cfg = Cfg;
+
+            // Which XInput slots exist (Parsec adds/removes its virtual pads as guests come and go).
+            if (now - lastSlotScan >= 1000)
+            {
+                lastSlotScan = now;
+                string sl = Bridge.SlotList();
+                if (sl != slots) { Log.Write("XInput pads connected in slots: " + sl); slots = sl; }
+            }
+            if (cfg.Pad != padSetting) { padSetting = cfg.Pad; pad = -1; lastScan = -1000; }
+
+            if (testRequested)
+            {
+                testRequested = false;
+                testStart = now;
+                Log.Write("Test pattern for 12 s: L+R three times, D-pad right and left, left stick circle");
+            }
+            if (testStart >= 0 && now - testStart >= 12000) { testStart = -1; Log.Write("Test pattern finished"); }
+            bool testing = TestForever || testStart >= 0;
+
+            byte[] report;
+            if (testing)
+            {
+                report = TestScript.At(TestForever ? now : now - testStart);
+            }
+            else
+            {
+                frame.Clear();
+                XInputState st = new XInputState();
+                bool have = pad >= 0 && XInput.TryGet(pad, out st);
+                if (!have && now - lastScan >= 1000)
+                {
+                    lastScan = now;
+                    int p = Bridge.PickPad(cfg.Pad);
+                    if (p != pad)
+                    {
+                        Log.Write(p >= 0 ? "Using XInput pad in slot " + p
+                                         : (pad >= 0 ? "Pad in slot " + pad + " disappeared. " : "") + "Waiting for a controller...");
+                        pad = p;
+                    }
+                    if (pad >= 0) have = XInput.TryGet(pad, out st);
+                }
+                if (have) Mapper.FromXInput(st, cfg, frame);
+                if (cfg.Keyboard && KeyMapper.Apply(frame, cfg)) keyHeldAt = now;
+                report = Report.FromFrame(frame);
+            }
+
+            // Every button / D-pad change goes into the log file (sticks are summarized in stats).
+            string buttons = ButtonsOnly(report);
+            if (buttons != lastButtons) { Log.Write("input: " + buttons, false); lastButtons = buttons; }
+
+            // Send on change (at most every `interval` ms, always the newest state),
+            // plus a 20 Hz heartbeat so the Pi's failsafe stays happy.
+            long since = now - lastSend;
+            if ((!Report.Same(report, last) && since >= cfg.Interval) || since >= 50)
+            {
+                if (!Report.Same(report, last)) changes++;
+                sendTimer.Restart();
+                Link.Send(report);
+                long ms = sendTimer.ElapsedMilliseconds;
+                maxSendMs = Math.Max(maxSendMs, ms);
+                if (ms >= 20) slowSends++;
+                last = report;
+                lastSend = now;
+            }
+            Link.Poll();
+
+            if (Link.Online != wasOnline)
+            {
+                wasOnline = Link.Online;
+                Log.Write(wasOnline ? "Pi is answering (" + Link.Status + ")" : "Pi is NOT answering any more (" + Link.Status + ")");
+            }
+            if (wasOnline && Link.SwitchAttached != wasAttached)
+            {
+                wasAttached = Link.SwitchAttached;
+                Log.Write(wasAttached ? "Pi reports: Switch/PC is using the controller (USB configured)"
+                                      : "Pi reports: Switch NOT connected on USB");
+            }
+
+            if (now - lastStats >= 10000)
+            {
+                var s = Link.Stats;
+                Log.Write(string.Format(
+                    "stats {0:0}s: {1} | Switch: {2} | pad slot {3} (slots {4}) | keyboard {5} | sent {6}, send errors {7}, " +
+                    "changes {8} | status msgs from Pi {9} | round trip PC-Pi-PC {10} | max send {11} ms, slow sends {12} | " +
+                    "max loop {13} ms | holding: {14}",
+                    (now - lastStats) / 1000.0, Link.Status,
+                    Link.Online ? (Link.SwitchAttached ? "connected" : "not connected") : "?",
+                    pad, slots, cfg.Keyboard ? "on" : "off", s.Sent, s.SendErrors, changes, s.StatusRx,
+                    s.Rtt.TakeSummary(), maxSendMs, slowSends, maxLoopMs, Report.Describe(report)), false);
+                s.Sent = s.SendErrors = s.StatusRx = 0;
+                changes = slowSends = 0;
+                maxSendMs = maxLoopMs = 0;
+                lastStats = now;
+            }
+
+            if (now - lastSecond >= 1000)
+            {
+                lastSecond = now;
+                Array.Copy(ping, 1, ping, 0, ping.Length - 1);
+                ping[ping.Length - 1] = Link.Online ? Link.Stats.Rtt.TakeSecond() : -1;
+                var ls = Link.Stats;
+                sentPerSec = (int)(ls.TotalSent - sent0); sent0 = ls.TotalSent;
+                rxPerSec = (int)(ls.TotalStatusRx - rx0); rx0 = ls.TotalStatusRx;
+            }
+
+            if (now - lastSnap >= 30)
+            {
+                lastSnap = now;
+                double rtt = Link.Stats.Rtt.Smooth;
+                Snap = new Snapshot
+                {
+                    Online = Link.Online,
+                    Attached = Link.SwitchAttached,
+                    Testing = testing,
+                    Keyboard = cfg.Keyboard,
+                    KeyboardHeld = now - keyHeldAt < 1500,
+                    LinkText = Link.Status,
+                    Host = Link.Host,
+                    Address = Link.Address,
+                    Slots = slots,
+                    Ping = Link.Online ? rtt : -1,
+                    Current = report,
+                    PadSlot = pad,
+                    SentPerSec = sentPerSec,
+                    RepliesPerSec = rxPerSec,
+                    PingHistory = (double[])ping.Clone(),
+                };
+            }
+
+            if (ConsoleStatus && now - lastPrint >= 200)
+            {
+                lastPrint = now;
+                double rtt = Link.Stats.Rtt.Smooth;
+                Con.Status(string.Format("{0} | Switch: {1} | Ping: {2} | Pressed: {3}",
+                    Link.Status,
+                    Link.Online ? (Link.SwitchAttached ? "connected" : "not connected") : "?",
+                    Link.Online && rtt >= 0 ? string.Format("{0:0} ms", rtt) : "?",
+                    Report.Describe(report)));
+            }
+            Thread.Sleep(1);
+        }
+
+        for (int i = 0; i < 5; i++) { Link.Send(Report.Neutral()); Thread.Sleep(10); } // release everything
+    }
+
+    static string ButtonsOnly(byte[] r)
+    {
+        var copy = (byte[])r.Clone();
+        copy[3] = copy[4] = copy[5] = copy[6] = 128; // ignore sticks
+        return Report.Describe(copy);
+    }
+}
+
+// Helpers shared by both programs.
+static class Bridge
+{
+    public const string Version = "2026-11-24 (window + keyboard)";
+
+    // Only one SwitchPad.exe / SwitchPadBridge.exe at a time: two would fight over the controller.
+    public static Mutex SingleInstance()
+    {
+        bool created;
+        var m = new Mutex(true, "Local\\SwitchPadBridge", out created);
+        if (created) return m;
+        m.Dispose();
+        return null;
+    }
+
+    public static string WindowsBuild()
     {
         try
         {
             const string key = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
             return Microsoft.Win32.Registry.GetValue(key, "ProductName", "?") + " " +
-                   Microsoft.Win32.Registry.GetValue(key, "CurrentBuild", "?");
+                   Microsoft.Win32.Registry.GetValue(key, "CurrentBuild", "?") +
+                   (Environment.Is64BitProcess ? " 64-bit" : " 32-bit");
         }
         catch (Exception) { return Environment.OSVersion.Version.ToString(); }
     }
 
-    static System.Collections.Generic.List<string> DeviceLines()
+    public static List<string> DeviceLines()
     {
-        var lines = new System.Collections.Generic.List<string>();
+        var lines = new List<string>();
         lines.Add("XInput pads:");
         bool any = false;
         for (int i = 0; i < 4; i++)
@@ -616,7 +1519,7 @@ Extra buttons: Guide or Back+Start = HOME, Back + right-stick click = CAPTURE.";
         return lines;
     }
 
-    static string SlotList()
+    public static string SlotList()
     {
         var sb = new StringBuilder();
         for (int i = 0; i < 4; i++)
@@ -627,138 +1530,115 @@ Extra buttons: Guide or Back+Start = HOME, Back + right-stick click = CAPTURE.";
         return sb.Length == 0 ? "none" : sb.ToString();
     }
 
-    static string ButtonsOnly(byte[] r)
-    {
-        var copy = (byte[])r.Clone();
-        copy[3] = copy[4] = copy[5] = copy[6] = 128; // ignore sticks
-        return Report.Describe(copy);
-    }
-
-    static int PickPad(int fixedPad)
+    public static int PickPad(int fixedPad)
     {
         XInputState s;
         if (fixedPad >= 0) return XInput.TryGet(fixedPad, out s) ? fixedPad : -1;
         for (int i = 3; i >= 0; i--) if (XInput.TryGet(i, out s)) return i; // Parsec's pads usually take the later slots
         return -1;
     }
+}
 
-    static void Run(UdpLink link, string linkName, int fixedPad, bool positional, bool test, int seconds, int interval)
+// ------------------------------------------------------------------ console program
+
+#if !GUI
+static class Program
+{
+    const string Usage =
+@"SwitchPadBridge - console version of SwitchPad.exe. Sends an Xbox/XInput pad and the keyboard
+to the SwitchPad Pi (Nintendo Switch). It uses settings.ini (made by SwitchPad.exe) if there is
+one; the options below override it for this run.
+
+Usage: SwitchPadBridge.exe [options]
+  --pi HOST       the Pi's IP address or name (default: switchpad.local).
+                  The IP address is faster, e.g. --pi 192.168.137.79
+  --pad N         XInput slot 0-3 to read (default: auto = highest connected slot)
+  --layout L      position (default): Xbox A/B/X/Y -> Switch B/A/Y/X (same physical spot)
+                  label: Xbox A/B/X/Y -> Switch A/B/X/Y (same letter)
+  --no-keyboard   ignore the keyboard
+  --interval MS   minimum time between packets (default: 1)
+  --test          send a scripted test pattern instead of reading a pad
+  --list          list XInput pads, then exit
+  --seconds N     stop after N seconds (default: run until Ctrl+C)
+
+Extra buttons: Guide or Back+Start = HOME, Back + right-stick click = CAPTURE.
+Keyboard: WASD = left stick, arrows = right stick, J/K/U/I = B/A/Y/X, Q/E = L/R, 1/3 = ZL/ZR,
+Enter = +, Backspace = -, H = HOME, F12 = CAPTURE. Change them in SwitchPad.exe.";
+
+    static int Main(string[] args)
     {
-        var clock = Stopwatch.StartNew();
-        byte[] last = null;
-        long lastSend = -1000, lastPrint = -1000, lastScan = -1000, lastSlotScan = -1000, lastStats = 0, prevIter = 0;
-        int pad = -1;
-        string slots = null, lastButtons = null;
-        bool wasOnline = false, wasAttached = false;
-        // stats, reset every 10 s
-        int changes = 0, slowSends = 0;
-        long maxSendMs = 0, maxLoopMs = 0;
-        var sendTimer = new Stopwatch();
-
-        Log.Write(string.Format("Sending to {0} ({1}, {2}, min interval {3} ms). Ctrl+C to quit.", linkName,
-            test ? "TEST PATTERN" : "layout " + (positional ? "position" : "label"),
-            fixedPad >= 0 ? "pad " + fixedPad : "pad auto", interval));
-
-        while (!stop && (seconds <= 0 || clock.ElapsedMilliseconds < seconds * 1000L))
+        Settings cfg = Settings.Load();
+        int seconds = 0;
+        bool test = false, list = false;
+        try
         {
-            long now = clock.ElapsedMilliseconds;
-            maxLoopMs = Math.Max(maxLoopMs, now - prevIter);
-            prevIter = now;
-
-            // Which XInput slots exist (Parsec adds/removes its virtual pads as guests come and go).
-            if (now - lastSlotScan >= 1000)
+            for (int i = 0; i < args.Length; i++)
             {
-                lastSlotScan = now;
-                string sl = SlotList();
-                if (sl != slots) { Log.Write("XInput pads connected in slots: " + sl); slots = sl; }
-            }
-
-            byte[] report;
-            if (test)
-            {
-                report = TestScript.At(now);
-            }
-            else
-            {
-                XInputState st = new XInputState();
-                bool have = pad >= 0 && XInput.TryGet(pad, out st);
-                if (!have && now - lastScan >= 1000)
+                switch (args[i].ToLowerInvariant())
                 {
-                    lastScan = now;
-                    int p = PickPad(fixedPad);
-                    if (p != pad)
-                    {
-                        Log.Write(p >= 0 ? "Using XInput pad in slot " + p
-                                         : (pad >= 0 ? "Pad in slot " + pad + " disappeared. " : "") + "Waiting for a controller...");
-                        pad = p;
-                    }
-                    if (pad >= 0) have = XInput.TryGet(pad, out st);
+                    case "--pi": case "--wifi": cfg.Pi = args[++i]; break; // --wifi: older name
+                    case "--pad": cfg.Pad = int.Parse(args[++i]); if (cfg.Pad < 0 || cfg.Pad > 3) throw new FormatException(); break;
+                    case "--layout":
+                        string l = args[++i].ToLowerInvariant();
+                        if (l == "position") cfg.Positional = true;
+                        else if (l == "label") cfg.Positional = false;
+                        else throw new FormatException();
+                        break;
+                    case "--interval": cfg.Interval = int.Parse(args[++i]); break;
+                    case "--no-keyboard": cfg.Keyboard = false; break;
+                    case "--test": test = true; break;
+                    case "--list": list = true; break;
+                    case "--seconds": seconds = int.Parse(args[++i]); break;
+                    default: throw new FormatException();
                 }
-                report = have ? Mapper.Build(st, positional) : Report.Neutral();
             }
-
-            // Every button / D-pad change goes into the log file (sticks are summarized in stats).
-            string buttons = ButtonsOnly(report);
-            if (buttons != lastButtons) { Log.Write("input: " + buttons, false); lastButtons = buttons; }
-
-            // Send on change (at most every `interval` ms, always the newest state),
-            // plus a 20 Hz heartbeat so the Pi's failsafe stays happy.
-            long since = now - lastSend;
-            if ((!Report.Same(report, last) && since >= interval) || since >= 50)
-            {
-                if (!Report.Same(report, last)) changes++;
-                sendTimer.Restart();
-                link.Send(report);
-                long ms = sendTimer.ElapsedMilliseconds;
-                maxSendMs = Math.Max(maxSendMs, ms);
-                if (ms >= 20) slowSends++;
-                last = report;
-                lastSend = now;
-            }
-            link.Poll();
-
-            if (link.Online != wasOnline)
-            {
-                wasOnline = link.Online;
-                Log.Write(wasOnline ? "Pi is answering (" + link.Status + ")" : "Pi is NOT answering any more (" + link.Status + ")");
-            }
-            if (wasOnline && link.SwitchAttached != wasAttached)
-            {
-                wasAttached = link.SwitchAttached;
-                Log.Write(wasAttached ? "Pi reports: Switch/PC is using the controller (USB configured)"
-                                      : "Pi reports: Switch NOT connected on USB");
-            }
-
-            if (now - lastStats >= 10000)
-            {
-                var s = link.Stats;
-                Log.Write(string.Format(
-                    "stats {0:0}s: {1} | Switch: {2} | pad slot {3} (slots {4}) | sent {5}, send errors {6}, " +
-                    "changes {7} | status msgs from Pi {8} | round trip PC-Pi-PC {9} | max send {10} ms, slow sends {11} | " +
-                    "max loop {12} ms | holding: {13}",
-                    (now - lastStats) / 1000.0, link.Status,
-                    link.Online ? (link.SwitchAttached ? "connected" : "not connected") : "?",
-                    pad, slots, s.Sent, s.SendErrors, changes, s.StatusRx,
-                    s.Rtt.TakeSummary(), maxSendMs, slowSends, maxLoopMs, Report.Describe(report)), false);
-                s.Sent = s.SendErrors = s.StatusRx = 0;
-                changes = slowSends = 0;
-                maxSendMs = maxLoopMs = 0;
-                lastStats = now;
-            }
-
-            if (now - lastPrint >= 200)
-            {
-                lastPrint = now;
-                double rtt = link.Stats.Rtt.Smooth;
-                Con.Status(string.Format("{0} | Switch: {1} | Ping: {2} | Pressed: {3}",
-                    link.Status,
-                    link.Online ? (link.SwitchAttached ? "connected" : "not connected") : "?",
-                    link.Online && rtt >= 0 ? string.Format("{0:0} ms", rtt) : "?",
-                    Report.Describe(report)));
-            }
-            Thread.Sleep(1);
+        }
+        catch (Exception)
+        {
+            Console.WriteLine(Usage);
+            return 1;
         }
 
-        for (int i = 0; i < 5; i++) { link.Send(Report.Neutral()); Thread.Sleep(10); } // release everything
+        if (list) { foreach (var l in Bridge.DeviceLines()) Console.WriteLine(l); return 0; }
+
+        Mutex mutex = Bridge.SingleInstance();
+        if (mutex == null)
+        {
+            Console.WriteLine("SwitchPad is already running (SwitchPad.exe in the tray, or another SwitchPadBridge.exe). Close it first.");
+            return 2;
+        }
+
+        Native.DisableQuickEdit();
+        Con.Start();
+        Log.Open();
+        Log.Write("=== SwitchPadBridge " + Bridge.Version + " started, log file: " + Log.FilePath);
+        Log.Write("Arguments: " + (args.Length == 0 ? "(none)" : string.Join(" ", args)) +
+                  " | Windows build " + Bridge.WindowsBuild(), false);
+        Log.Write("Settings: " + cfg.Summary() + (File.Exists(Settings.FilePath) ? "" : " (no settings.ini, defaults)"), false);
+        foreach (var l in Bridge.DeviceLines()) Log.Write(l, false);
+        AppDomain.CurrentDomain.UnhandledException += (s, e) => Log.Write("CRASH (unhandled): " + e.ExceptionObject);
+
+        if (cfg.Keyboard && !test) KeyboardHook.Start();
+        var engine = new Engine(cfg);
+        engine.ConsoleStatus = true;
+        engine.TestForever = test;
+        engine.Seconds = seconds;
+
+        Console.CancelKeyPress += (s, e) => { e.Cancel = true; engine.StopRequested = true; };
+        Log.Write("Precise timer when in the background: " + Native.KeepTimerPrecise(), false);
+        Native.timeBeginPeriod(1);
+        try { engine.Run(); }
+        catch (Exception e) { Log.Write("CRASH: " + e); throw; }
+        finally
+        {
+            Native.timeEndPeriod(1);
+            Log.Write("=== Stopped. Log file: " + Log.FilePath);
+            Log.Close();
+            Con.Flush();
+            Console.WriteLine();
+            GC.KeepAlive(mutex);
+        }
+        return 0;
     }
 }
+#endif

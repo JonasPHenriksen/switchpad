@@ -1,10 +1,17 @@
 # SwitchPad – Switch 1 controller bridge (Pi Zero W)
 
 ```
-Parsec guest pad -> Parsec virtual Xbox pad (PC) -> SwitchPadBridge.exe
+Parsec guest pad or keyboard -> PC (Parsec's virtual Xbox pad / keys) -> SwitchPad.exe
    -> Wi-Fi -> Pi Zero W -> its "USB" port -> Switch dock
 Switch HDMI -> capture card -> PC -> Parsec
 ```
+
+On the PC there are two programs, built from the same code by `windows\build.cmd`:
+- **`SwitchPad.exe`**: the normal one. A window with live status, keyboard mapping and
+  settings, which minimizes to a tray icon next to the clock.
+- **`SwitchPadBridge.exe`**: the same thing as a console program, for testing and logs.
+
+Only one of them can run at a time. Both keep their settings in `windows\settings.ini`.
 
 The Pi shows up on the Switch as a plain wired pad (HORI Pokken style). That means
 no motion controls, no rumble and no amiibo. Every normal button and stick works.
@@ -67,10 +74,14 @@ The install also saves diagnostics onto the card (`switchpad\diag.txt` and the
 
 ## 4. Find the Pi on the network
 
-Run `windows\SwitchPadBridge.exe --test`. By default it looks for `switchpad.local`.
-The line `Wi-Fi: switchpad.local is 192.168.x.y` shows the Pi's IP address. From then on start it with
-that address, e.g. `SwitchPadBridge.exe --pi 192.168.1.50`: looking up the name can take
-10+ seconds on Windows. Your router's device list also shows the IP.
+Start `windows\SwitchPad.exe`. (If it's missing, run `windows\build.cmd` first.) By default
+it looks for `switchpad.local`; once it finds the Pi, the **Pi** box at the top says
+**Online** and shows the Pi's IP address.
+
+- Faster: open **Settings** and click **Find Pi**. It asks every network the PC is on and
+  saves the address the Pi answers from.
+- Or type the IP address into **Pi address** and click **Apply** (your router's device list
+  also shows it). Looking up the name can take 10+ seconds on Windows, so the IP connects faster.
 
 If the Pi is never found, check that it's on the same Wi-Fi as the PC (router device list,
 or the HDMI screen) and that the Wi-Fi details in step 1 were right.
@@ -81,12 +92,12 @@ or the HDMI screen) and that the Wi-Fi details in step 1 were right.
    That one cable powers the Pi and carries the data. Never use both ports at once.
 2. After about 40 s, Windows finds a game controller. Open it with `Win+R` → `joy.cpl`.
    It is listed as **POKKEN CONTROLLER**; click Properties.
-3. Run `windows\SwitchPadBridge.exe --pi <IP> --test`. (If the .exe is missing, run
-   `build.cmd` first.)
-   - The status line should show `Wi-Fi online` and `Switch: connected`.
+3. In `SwitchPad.exe`, open **Settings** and click **Send test pattern (12 s)**.
+   - The boxes at the top should show **Pi: Online** and **Switch: Connected**.
      "Switch" here means whatever the Pi's USB port is plugged into, so the PC counts.
    - In joy.cpl, L+R light up three times, then the D-pad moves, then the left stick
-     draws a circle.
+     draws a circle. The **Dashboard** picture shows the same.
+   - Console alternative: `windows\SwitchPadBridge.exe --pi <IP> --test` (Ctrl+C stops it).
 
 ## 6. On the Switch
 
@@ -94,8 +105,8 @@ or the HDMI screen) and that the Wi-Fi details in step 1 were right.
    **Pro Controller Wired Communication: On**
 2. Connect the Pi's **USB** port to a USB port on the dock. Wait about 40 s for it to boot.
 3. On the Switch, open Controllers → **Change Grip/Order**.
-4. On the PC, run `SwitchPadBridge.exe --pi <IP> --test`. The L+R presses register the
-   controller.
+4. On the PC, in `SwitchPad.exe` → **Settings**, click **Send test pattern (12 s)**. The L+R
+   presses register the controller.
 
 **If the Switch never sees the Pi** but the PC does: force full-speed USB, which is what
 the real HORI controller uses.
@@ -107,13 +118,32 @@ Delete that file to go back.
 ## 7. Playing over Parsec
 
 1. Parsec → Settings → Host → **Virtual Gamepad Type: Xbox 360**.
-2. Once the guest is connected, run `SwitchPadBridge.exe --pi <IP>`.
-   - It reads the **highest connected XInput slot**, which is normally Parsec's pad.
-     If it picks your own controller, run `SwitchPadBridge.exe --list` to see the slots
-     and pass `--pad N`.
-   - Leave the window open while playing. Ctrl+C releases every button and quits.
+2. Start `SwitchPad.exe` (it can stay running all the time; see "Startup" below).
+   - With a controller, it reads the **highest connected XInput slot**, which is normally
+     Parsec's pad. If it picks your own controller, pick Parsec's slot under
+     **Settings → Controller** ("Connected now" lists the slots).
+   - A guest without a controller can play with the **keyboard** (see below).
+   - Minimizing the window hides it in the tray. Double-click the tray icon to open it
+     again. **Quit SwitchPad** in the tray icon's menu releases every button and stops it.
 
-### Button mapping (default `--layout position`)
+### The SwitchPad window
+
+- **Top row:** Pi (online and its address), Switch (whether it's using the controller),
+  Ping (round trip PC → Pi → PC), Input (controller, keyboard or both).
+- **Dashboard:** a controller picture of exactly what the Switch receives, the ping over
+  the last minute, and details: the last key pressed and whether it came from Parsec.
+- **Keyboard:** the key mapping (below).
+- **Settings:** Pi address and **Find Pi**, controller slot, button layout, ZL/ZR trigger
+  point, stick deadzone, startup, and the test pattern.
+- **Log:** everything that's also written to the log file.
+
+The tray icon's colour tells you the state at a glance: **green** = all good, **yellow** =
+Pi answering but the Switch isn't using the controller, **red** = no answer from the Pi.
+
+**Startup:** under Settings, "Start SwitchPad when I sign in to Windows" starts it in the
+tray at every sign-in; "Start minimized to the tray" does that for manual starts too.
+
+### Button mapping (default: same position)
 
 | Xbox (guest) | Switch |
 |---|---|
@@ -125,7 +155,44 @@ Delete that file to go back.
 | Guide, or Back+Start | HOME |
 | Back + right-stick click | Capture |
 
-Use `--layout label` if you want the letters to match instead (Xbox A → Switch A).
+Choose **Settings → Button layout → Same letter** if you want the letters to match instead
+(Xbox A → Switch A). (Console: `--layout label`.)
+
+### Keyboard
+
+When a Parsec guest types, the keys arrive on the PC like normal key presses. SwitchPad
+reads them **whichever window has focus**, so the capture viewer can stay in front.
+
+| Keys (default) | Switch |
+|---|---|
+| W A S D | left stick |
+| Arrow keys | right stick |
+| Left Shift (held) | "walk": the sticks tilt only 50% |
+| K / J / I / U | A / B / X / Y |
+| Q / E | L / R |
+| 1 / 3 | ZL / ZR |
+| Enter / Backspace | + / − |
+| H / F12 | HOME / Capture |
+| C / O | left / right stick click |
+| Numpad 8 2 4 6 | D-pad |
+
+**Changing a key:** open **Keyboard**, click a button on the controller picture (for a
+stick, click the side you want, or its middle for the stick click), then press the new
+key. A key can only do one thing: giving it to a new button takes it away from the old
+one. Each button can have a 2nd key (**Add 2nd key**). Changes are saved immediately.
+Press the keys to try them: the picture lights up what the Switch receives.
+
+Options on the Keyboard tab:
+- **Use the keyboard:** on/off (also in the tray icon's menu).
+- **Hide mapped keys from other programs:** mapped keys only go to the Switch, not also to
+  the window that has focus. While it's on, those keys don't type anywhere on the PC.
+- **Only keys sent by programs (Parsec):** ignores keys typed on the PC's own keyboard, so
+  the person at the PC can keep typing. First press a key through Parsec and check that
+  the Dashboard says **"sent by a program"**; only then turn this on.
+- **Walk key tilt:** how far the sticks tilt while the walk key is held.
+
+A controller and the keyboard can be used together. While a stick's keys are held, they
+override that stick.
 
 ## Raspberry Pi 4 on Ethernet
 
@@ -156,27 +223,27 @@ audio/video output, not a power input.
   and password, and enable SSH.
 - **Step 3:** for the first boot, power the Pi from the dock (Switch docked and on) or from
   any USB-C phone charger. Plug in the Ethernet cable before powering it on.
-- **Step 4:** the router gives the Pi its address. `SwitchPadBridge.exe` finds
-  `switchpad.local` by itself and prints the IP, and the router's device list shows it
-  too. Reserving that address for the Pi in the router keeps it the same.
+- **Step 4:** the router gives the Pi its address. `SwitchPad.exe` finds
+  `switchpad.local` by itself (or click **Find Pi**) and shows the IP, and the router's
+  device list shows it too. Reserving that address for the Pi in the router keeps it the same.
 - **Step 5** (test on the PC) works the same, with the Pi 4's USB-C port connected to the PC.
 
 **Good to know:**
 - **The Pi runs only while the dock powers it.** When the Switch goes to sleep or is taken
   out of the dock, the dock may cut power to its USB ports. The Pi then switches off and
   needs about 30 s to start again once power is back.
-- **Labels:** the programs still call the connection "Wi-Fi": the PC shows `Wi-Fi online`
-  and the Pi's log shows `wifi NOT CONNECTED`. That's normal on a cable and doesn't
-  matter.
-- **If the PC shows `Switch: not connected`:** check that the cable carries data, that it's
+- **Labels:** the Pi's log shows `wifi NOT CONNECTED`. That's normal on a cable and
+  doesn't matter.
+- **If the PC shows Switch: Not connected:** check that the cable carries data, that it's
   in the Pi's USB-C port, and that the Switch is docked and awake. To rule out the dock,
   connect the Pi's USB-C port to the PC and open `joy.cpl` (step 5): if **POKKEN
   CONTROLLER** appears there, the Pi and cable work.
 
 ## Wi-Fi lag and hiccups
 
-The status line shows **`Ping: N ms`**: the round trip PC → Pi → PC. The delay our part
-adds is about half of that; a few ms is normal. If the guest still feels a big delay
+The **Ping** box and the graph on the Dashboard show the round trip PC → Pi → PC (the
+console version shows `Ping: N ms`). The delay our part adds is about half of that; a few
+ms is normal. If the guest still feels a big delay
 while Ping stays low, the lag is in Parsec, the capture card or the guest's own internet.
 
 If Ping jumps around or input stops for a moment:
@@ -194,15 +261,16 @@ hiccup can't leave a button held down.
 ## Logs: collect everything in one go
 
 Both sides log everything automatically:
-- **PC:** `SwitchPadBridge.exe` writes `windows\logs\bridge-<date>-<time>.log`: when the Pi
-  answers and stops answering, which XInput slots exist, every button press, and a stats
-  line every 10 s (packets, Ping average and maximum).
+- **PC:** `SwitchPad.exe` (and `SwitchPadBridge.exe`) write `windows\logs\bridge-<date>-<time>.log`:
+  when the Pi answers and stops answering, which XInput slots exist, setting and key-map
+  changes, every button press, and a stats line every 10 s (packets, Ping average and
+  maximum). The **Log** tab shows the same lines live.
 - **Pi:** `switchpad.log` on the SD card, the journal, and the HDMI screen: USB state
   changes, every Wi-Fi hiccup longer than 0.3 s, lost packets, Wi-Fi signal and speed,
   power problems (under-voltage), and a stats line every 10 s. `pi delay` there is how
   long an input waits on the Pi before the Switch takes it.
 
-To send them, play until the problem happens, close `SwitchPadBridge.exe`, then run:
+To send them, play until the problem happens, then run (SwitchPad can keep running):
 ```
 windows\collect-logs.cmd USER@<Pi's IP>
 ```
@@ -236,11 +304,16 @@ about 3 minutes.
 
 ## Troubleshooting
 
-| Message in SwitchPadBridge | Meaning |
+| What SwitchPad shows | Meaning |
 |---|---|
-| `looking up switchpad.local...` | The name lookup is slow or failing. Start with `--pi <IP>` instead (step 4). |
-| `no reply from <IP>` | The Pi is off, still booting, or not on the same network. |
-| `Switch: not connected` | Check the cable is in the Pi's **USB** port (Pi 4: the **USB-C** port), that it's a data cable, and that the Switch is docked and awake. |
+| Pi: **Looking up…** | The name lookup is slow or failing. Click **Find Pi**, or enter the Pi's IP address (step 4). |
+| Pi: **No reply** | The Pi is off, still booting, or not on the same network. |
+| Switch: **Not connected** | Check the cable is in the Pi's **USB** port (Pi 4: the **USB-C** port), that it's a data cable, and that the Switch is docked and awake. |
+| "SwitchPad is already running" | Only one SwitchPad can run. Look for its tray icon (maybe under the ^ arrow next to the clock), or close `SwitchPadBridge.exe`. |
+| Keys don't do anything | Check **Use the keyboard**, and the "last key" line on the Dashboard. Windows doesn't show a program the keys typed into a window that runs **as administrator**: keep such a window out of focus, or run SwitchPad as administrator too. |
+
+The console version's messages mean the same: `looking up switchpad.local...`,
+`no reply from <IP>`, `Switch: not connected`. Its options: `SwitchPadBridge.exe --help`.
 
 With SSH: the service log is `journalctl -u switchpad -f`, and
 `sudo python3 /boot/firmware/switchpad/switchpad.py status` shows whether the Switch is
