@@ -135,8 +135,8 @@ Delete that file to go back.
   the last minute, and details: the last key pressed and whether it came from Parsec.
 - **Keyboard:** the key mapping (below).
 - **Pi:** the Pi's health and buttons to test, restart or update it (below).
-- **Settings:** Pi address and **Find Pi**, controller slot, console (Switch or PS3), the Pi's
-  low-power mode, button layout, trigger point, stick deadzone, startup, and the test pattern.
+- **Settings:** Pi address and **Find Pi**, controller slot, console (Switch or PS3), button
+  layout, trigger point, stick deadzone, startup, and the test pattern.
 - **Log:** everything that's also written to the log file.
 
 The tray icon's colour tells you the state at a glance: **green** = all good, **yellow** =
@@ -155,7 +155,6 @@ tray at every sign-in; "Start minimized to the tray" does that for manual starts
   makes USB and the network unreliable. The Pi box at the top then also says **Low power!**,
 - **USB to the console**: in use, not connected, or suspended (console asleep),
 - **Console mode**: Switch or PS3, and in PS3 mode whether the PS button works,
-- **Low-power mode**: off, or what it changed on the Pi (see [Power for a Pi 4](#power-for-a-pi-4)),
 - how long the Pi and SwitchPad have been running, packets received / lost from the PC,
   network gaps, failsafe releases and USB write errors since SwitchPad started.
 
@@ -237,11 +236,9 @@ extra hardware is needed: the PS3 accepts ordinary USB game pads.
    its USB side within a second or two and keeps PS3 mode until you switch back, also after
    a reboot. The Pi tab shows **Console mode: PS3**. (Console version: `--console ps3`.
    `SwitchPadBridge.exe` and `SwitchPad.exe` always set the Pi to their own console setting.)
-3. Connect the Pi's **USB** port to a USB port on the PS3. The PS3 powers the Pi; give it
-   about 40 s to boot. A **Pi Zero W** is fine on a PS3 port. A **Pi 4 is not**: it needs
-   more power than a PS3 port gives (0.5 A), runs in under-voltage and restarts by itself
-   every minute or so. Put a **powered USB hub** (one with its own power adapter) between
-   the PS3 and the Pi 4's USB-C port; see [Power for a Pi 4](#power-for-a-pi-4).
+3. Connect the Pi's **USB** port (Pi 4: the USB-C port) to a USB port on the PS3. The PS3
+   powers the Pi; give it about 40 s to boot. A Pi Zero W is fine on a PS3 port. A Pi 4 needs
+   more power than a PS3 port is meant to give: if the Pi tab shows **Low power!**, that's why.
 4. Play as usual. **Settings → Send test pattern** presses L1+R1, the D-pad and the left stick.
 
 | Xbox (guest) | PS3 |
@@ -312,36 +309,12 @@ audio/video output, not a power input.
   out of the dock, the dock may cut power to its USB ports. The Pi then switches off and
   needs about 30 s to start again once power is back.
 - **Network:** the Pi tab and the Pi's log say which connection is in use, e.g.
-  `Ethernet 1000 Mbit/s, full duplex` (100 Mbit/s in low-power mode). (Pi software before
-  2026-11-24 logged `wifi NOT CONNECTED` on a cable; that was only a wrong label.)
+  `Ethernet 1000 Mbit/s, full duplex`. (Pi software before 2026-11-24 logged
+  `wifi NOT CONNECTED` on a cable; that was only a wrong label.)
 - **If the PC shows Switch: Not connected:** check that the cable carries data, that it's
   in the Pi's USB-C port, and that the Switch is docked and awake. To rule out the dock,
   connect the Pi's USB-C port to the PC and open `joy.cpl` (step 5): if **POKKEN
   CONTROLLER** appears there, the Pi and cable work.
-- **If the Pi restarts by itself,** it isn't getting enough power: see the next section.
-
-### Power for a Pi 4
-
-A Pi 4 draws about 0.6 A, and more than 1 A in short bursts while it starts. A console's USB
-port is only meant for 0.5 A: Nintendo doesn't publish a figure for the Switch dock's ports
-(they usually manage, depending on the dock and the port), and a PS3 port is too weak. When
-the power isn't enough, the Pi tab's **Power** row and the Pi box at the top say
-**UNDER-VOLTAGE** / **Low power!**, the Pi slows itself down, and it eventually loses power
-and restarts by itself (its log then shows a new start with no "Stopping" line before it).
-
-Fixes, surest first:
-1. **A powered USB hub** between the console and the Pi (a hub with its own power adapter).
-   The console still sees the controller through the hub.
-2. **Another port:** on the Switch dock, try the other USB port.
-3. **Settings → Pi power → Low-power mode** in `SwitchPad.exe` (console version:
-   `--low-power on`). The Pi then runs its CPU at the lowest speed, turns its LEDs off, turns
-   its Wi-Fi radio off while the PC reaches it over Ethernet (back on by itself if that
-   stops), and runs Ethernet at 100 Mbit/s, which is plenty for a controller. It takes effect
-   at once and stays on after a restart; the Pi tab's **Low-power mode** row shows what it
-   changed. It lowers the power the Pi needs while running, but starting up still needs
-   full power, so it may or may not be enough on its own.
-
-A **Pi Zero W** uses about a quarter of a Pi 4's power and is fine on any console port.
 
 ## Wi-Fi lag and hiccups
 
@@ -415,8 +388,7 @@ about 3 minutes.
 | Pi: **Looking up…** | The name lookup is slow or failing. Click **Find Pi**, or enter the Pi's IP address (step 4). |
 | Pi: **No reply** | The Pi is off, still booting, or not on the same network. |
 | Switch / PS3: **Not connected** | Check the cable is in the Pi's **USB** port (Pi 4: the **USB-C** port), that it's a data cable, and that the Switch is docked and awake (or the PS3 is on). |
-| Pi: **Low power!** | The Pi reports under-voltage right now: the USB port, power supply or cable is too weak. For a Pi 4 on a console, see [Power for a Pi 4](#power-for-a-pi-4). |
-| **The Pi restarts by itself** (it stops answering, then comes back about 30 s later) | Almost always too little power: look for **UNDER-VOLTAGE** on the Pi tab. Use a powered USB hub, another port, or Low-power mode; see [Power for a Pi 4](#power-for-a-pi-4). |
+| Pi: **Low power!** | The Pi reports under-voltage right now: use a stronger power supply or a better cable. On a Pi 4 powered by the dock, try another dock USB port. |
 | Buttons do nothing in a game, but the Dashboard shows them | Run **Run self-test** on the Pi tab. If it says OK, the Pi ↔ Switch part works and the problem is between the PC and the Pi (see "Wi-Fi lag and hiccups"). |
 | "SwitchPad is already running" | Only one SwitchPad can run. Look for its tray icon (maybe under the ^ arrow next to the clock), or close `SwitchPadBridge.exe`. |
 | Keys don't do anything | Check **Use the keyboard**, and the "last key" line on the Dashboard. Windows doesn't show a program the keys typed into a window that runs **as administrator**: keep such a window out of focus, or run SwitchPad as administrator too. |

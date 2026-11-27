@@ -901,7 +901,6 @@ class Settings
     public string Pi = "switchpad.local";
     public int Pad = -1;                 // XInput slot, -1 = auto
     public bool Ps3 = false;             // console: false = Nintendo Switch, true = PS3 (the Pi is told to switch)
-    public bool PiLowPower = false;      // low-power mode on the Pi (Pi 4 on a weak USB port); the Pi is told
     public bool Positional = true;       // layout: true = position, false = label (Switch only)
     public int TriggerThreshold = 30;    // LT/RT value (0-255) above which ZL/ZR count as pressed
     public int Deadzone = 0;             // percent of stick travel ignored around the centre
@@ -936,7 +935,7 @@ class Settings
             Pi, Pad < 0 ? "auto" : Pad.ToString(), Positional || Ps3 ? "position" : "label", TriggerThreshold, Deadzone,
             Keyboard ? string.Format("on (hide mapped keys {0}, remote keys only {1}, walk {2}%)",
                 OnOff(BlockKeys), OnOff(RemoteKeysOnly), WalkPercent) : "off",
-            ConsoleName) + (PiLowPower ? ", Pi low-power mode" : "");
+            ConsoleName);
     }
 
     public string ConsoleName { get { return Ps3 ? "PS3" : "Switch"; } }
@@ -1011,7 +1010,6 @@ class Settings
             case "walk_percent": WalkPercent = Int(v, 10, 100); break;
             case "start_minimized": StartMinimized = Bool(v); break;
             case "pi_user": PiUser = v; break;
-            case "pi_low_power": PiLowPower = Bool(v); break;
             default: throw new FormatException();
         }
     }
@@ -1047,7 +1045,6 @@ class Settings
         sb.AppendLine("walk_percent=" + WalkPercent);
         sb.AppendLine("start_minimized=" + OnOff(StartMinimized));
         sb.AppendLine("pi_user=" + PiUser);
-        sb.AppendLine("pi_low_power=" + OnOff(PiLowPower));
         sb.AppendLine();
         sb.AppendLine("[keys]");
         sb.AppendLine("# Switch input = up to 2 Windows key names, e.g. W, Space, LShiftKey, D1 (the 1 key), NumPad8, Up");
@@ -1127,10 +1124,9 @@ class PiHealth
         string console = this["console"] == "ps3"
             ? ", PS3 mode (PS button: " + (this["ps_button"].Length > 0 ? this["ps_button"] : "?") + ")"
             : this["console"] == "switch" ? ", Switch mode" : "";
-        string low = this["lowpower"] == "on" ? ", low-power mode (" + this["lowpower_text"] + ")" : "";
-        return string.Format("{0}, SwitchPad {1}, {2}, CPU {3} C, power {4}, USB {5}{6}{7}",
+        return string.Format("{0}, SwitchPad {1}, {2}, CPU {3} C, power {4}, USB {5}{6}",
             this["model"], this["sw"], this["link_text"], this["temp"].Length > 0 ? this["temp"] : "?",
-            this["power_text"], this["usb"], console, low);
+            this["power_text"], this["usb"], console);
     }
 }
 
@@ -1550,8 +1546,8 @@ class Engine
         double onlineSince = -1;
         PiHealth lastHealth = null;
         string healthKey = null;
-        double lastConsoleCmdMs = -100000, lastLowPowerCmdMs = -100000;
-        bool warnedOldPi = false, warnedOldPiLowPower = false;
+        double lastConsoleCmdMs = -100000;
+        bool warnedOldPi = false;
 
         Settings c0 = Cfg;
         Log.Write(string.Format("Sending to the Pi at {0} ({1}, {2}, keyboard {3}, min interval {4} ms).{5}", c0.Pi,
@@ -1643,8 +1639,7 @@ class Engine
                 lastHealth = health;
                 // logged when something that matters changes (not every temperature wiggle)
                 string key = health["sw"] + "|" + health["link"] + "|" + health["dev"] + "|" + health["power"] + "|" +
-                             health["usb"] + "|" + health["console"] + "|" + health["ps_button"] + "|" +
-                             health["lowpower_text"];
+                             health["usb"] + "|" + health["console"] + "|" + health["ps_button"];
                 if (key != healthKey) { healthKey = key; Log.Write("Pi health: " + health.Summary()); }
             }
             // The console is a setting on the PC; the Pi keeps its own copy on the SD card. Tell it
@@ -1665,23 +1660,6 @@ class Engine
                 {
                     lastConsoleCmdMs = Clock.Ms;
                     Command("console " + cfg.ConsoleId);
-                }
-
-                // Low-power mode works the same way.
-                string piLow = health["lowpower"], wantLow = cfg.PiLowPower ? "on" : "off";
-                if (piLow.Length == 0)
-                {
-                    if (cfg.PiLowPower && !warnedOldPiLowPower)
-                    {
-                        warnedOldPiLowPower = true;
-                        Log.Write("The Pi's SwitchPad is older than this PC's and has no low-power mode: use Update Pi.");
-                        AddCommandLine("error: the Pi's SwitchPad has no low-power mode yet. Use Update Pi.");
-                    }
-                }
-                else if (piLow != wantLow && Clock.Ms - lastLowPowerCmdMs >= 8000)
-                {
-                    lastLowPowerCmdMs = Clock.Ms;
-                    Command("lowpower " + wantLow);
                 }
             }
             foreach (var r in Link.TakeReplies())
@@ -1780,7 +1758,7 @@ class Engine
 // Helpers shared by both programs.
 static class Bridge
 {
-    public const string Version = "2026-11-27b (window, keyboard, Pi health + controls, PS3 mode, Pi low-power mode)";
+    public const string Version = "2026-11-27 (window, keyboard, Pi health + controls, PS3 mode)";
 
     // Only one SwitchPad.exe / SwitchPadBridge.exe at a time: two would fight over the controller.
     public static Mutex SingleInstance()
@@ -1864,9 +1842,6 @@ Usage: SwitchPadBridge.exe [options]
                   LT/RT -> L2/R2, Back/Start -> Select/Start, Guide or Back+Start -> PS.
   --layout L      position (default): Xbox A/B/X/Y -> Switch B/A/Y/X (same physical spot)
                   label: Xbox A/B/X/Y -> Switch A/B/X/Y (same letter). Switch only.
-  --low-power M   on or off (default: as in settings.ini, else off): low-power mode on the Pi, for a Pi 4 that
-                  restarts by itself on a weak USB port. Slowest CPU speed, LEDs off,
-                  Wi-Fi radio off while Ethernet is used, Ethernet at 100 Mbit/s.
   --no-keyboard   ignore the keyboard
   --interval MS   minimum time between packets (default: 1)
   --test          send a scripted test pattern instead of reading a pad
@@ -1894,12 +1869,6 @@ Enter = +, Backspace = -, H = HOME, F12 = CAPTURE. Change them in SwitchPad.exe.
                         string c = args[++i].ToLowerInvariant();
                         if (c == "switch") cfg.Ps3 = false;
                         else if (c == "ps3") cfg.Ps3 = true;
-                        else throw new FormatException();
-                        break;
-                    case "--low-power":
-                        string lp = args[++i].ToLowerInvariant();
-                        if (lp == "on") cfg.PiLowPower = true;
-                        else if (lp == "off") cfg.PiLowPower = false;
                         else throw new FormatException();
                         break;
                     case "--layout":

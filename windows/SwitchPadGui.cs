@@ -884,7 +884,7 @@ class MainForm : Form
     readonly Dictionary<string, Label> healthValues = new Dictionary<string, Label>();
     Button btnSelftest, btnRestart, btnReboot;
     ListView mapList;
-    CheckBox chkKeyboard, chkBlock, chkRemote, chkStartup, chkMinimized, chkLowPower;
+    CheckBox chkKeyboard, chkBlock, chkRemote, chkStartup, chkMinimized;
     NumericUpDown numWalk, numTrigger, numDeadzone;
     TextBox txtPi, txtLog, txtUser;
     ComboBox cmbPad, cmbLayout, cmbConsole;
@@ -1153,7 +1153,6 @@ class MainForm : Form
         new[] { "power", "Power" },
         new[] { "usb", "USB to the console" },
         new[] { "console", "Console mode" },
-        new[] { "lowpower", "Low-power mode" },
         new[] { "up", "Running for" },
         new[] { "packets", "Packets from this PC" },
         new[] { "problems", "Hiccups and errors" },
@@ -1387,14 +1386,6 @@ class MainForm : Form
             SetHealth("console", ps == "ok" ? "PS3 (PS button works)" : "PS3 (PS button: " + (ps.Length > 0 ? ps : "?") + ")",
                 c(ps == "ok" ? Pal.Good : Pal.Warn));
         else SetHealth("console", "Switch", c(Pal.Text));
-        string low = h["lowpower"];
-        if (low.Length == 0)
-            SetHealth("lowpower", cfg.PiLowPower ? "This Pi's SwitchPad has no low-power mode yet: use Update Pi" : "–",
-                c(cfg.PiLowPower ? Pal.Bad : Pal.Idle));
-        else if ((low == "on") != cfg.PiLowPower)
-            SetHealth("lowpower", "Switching " + (cfg.PiLowPower ? "on" : "off") + "…", c(Pal.Warn));
-        else if (low == "on") SetHealth("lowpower", "On: " + h["lowpower_text"], c(Pal.Text));
-        else SetHealth("lowpower", "Off", c(Pal.Text));
         SetHealth("up", "Pi " + Dur(h.Num("uptime")) + "   ·   SwitchPad " + Dur(h.Num("running")), c(Pal.Text));
         SetHealth("packets", Count(h, "rx") + " received, " + Count(h, "lost") + " lost, " + Count(h, "late") + " out of order", c(Pal.Text));
         bool clean = h.Num("hiccups") == 0 && h.Num("failsafe") == 0 && h.Num("usb_err") == 0;
@@ -1412,10 +1403,9 @@ class MainForm : Form
     {
         long f = h.PowerFlags;
         if (f < 0) { color = Pal.Idle; return h["power_text"].Length > 0 ? h["power_text"] : "–"; }
-        const string fix = " The Pi may restart by itself. Use a powered USB hub, another port, or Settings → Low-power mode.";
-        if ((f & 0x1) != 0) { color = Pal.Bad; return "UNDER-VOLTAGE NOW: the USB port, power supply or cable is too weak." + fix; }
+        if ((f & 0x1) != 0) { color = Pal.Bad; return "UNDER-VOLTAGE NOW: the power supply or cable is too weak"; }
         if ((f & 0xE) != 0) { color = Pal.Warn; return "Slowed down now (too hot or low voltage)"; }
-        if ((f & 0x10000) != 0) { color = Pal.Warn; return "OK now, but there was under-voltage since the Pi started." + fix; }
+        if ((f & 0x10000) != 0) { color = Pal.Warn; return "OK now, but there was under-voltage since the Pi started"; }
         if ((f & 0xE0000) != 0) { color = Pal.Warn; return "OK now, but it was slowed down since the Pi started"; }
         color = Pal.Good;
         return "OK";
@@ -1459,12 +1449,6 @@ class MainForm : Form
         lblConsoleHint = Hint("");
         AddRow(t, ref row, "Console", cmbConsole, lblConsoleHint);
 
-        chkLowPower = Check("Low-power mode", null);
-        AddRow(t, ref row, "Pi power", chkLowPower, Hint(
-            "For a Pi 4 that restarts by itself on a weak USB port (a PS3, some dock ports): the Pi runs " +
-            "its CPU at the lowest speed, turns its LEDs off, its Wi-Fi radio off while Ethernet is used, " +
-            "and Ethernet at 100 Mbit/s. Starting up still needs full power: a powered USB hub is the sure fix."));
-
         cmbLayout = Combo("Same position (Xbox A → Switch B)", "Same letter (Xbox A → Switch A)");
         AddRow(t, ref row, "Button layout", cmbLayout, Hint("Which Switch button each Xbox face button presses. " +
             "On a PS3 it is always by position: Xbox A → Cross, B → Circle, X → Square, Y → Triangle."));
@@ -1491,7 +1475,6 @@ class MainForm : Form
 
         cmbPad.SelectedIndexChanged += (s, e) => Change(x => x.Pad = cmbPad.SelectedIndex - 1);
         cmbConsole.SelectedIndexChanged += (s, e) => Change(x => x.Ps3 = cmbConsole.SelectedIndex == 1);
-        chkLowPower.CheckedChanged += (s, e) => Change(x => x.PiLowPower = chkLowPower.Checked);
         cmbLayout.SelectedIndexChanged += (s, e) => Change(x => x.Positional = cmbLayout.SelectedIndex == 0);
         numTrigger.ValueChanged += (s, e) => Change(x => x.TriggerThreshold = (int)numTrigger.Value);
         numDeadzone.ValueChanged += (s, e) => Change(x => x.Deadzone = (int)numDeadzone.Value);
@@ -1535,7 +1518,6 @@ class MainForm : Form
         txtUser.Text = cfg.PiUser;
         cmbPad.SelectedIndex = cfg.Pad + 1;
         cmbConsole.SelectedIndex = cfg.Ps3 ? 1 : 0;
-        chkLowPower.Checked = cfg.PiLowPower;
         cmbLayout.SelectedIndex = cfg.Positional ? 0 : 1;
         numTrigger.Value = cfg.TriggerThreshold;
         numDeadzone.Value = cfg.Deadzone;
