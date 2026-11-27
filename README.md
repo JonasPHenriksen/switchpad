@@ -13,8 +13,10 @@ Switch HDMI -> capture card -> PC -> Parsec
 
 - The Pi appears on the Switch as a plain wired pad (HORI Pokken style HID): all buttons and
   sticks, no motion controls, rumble or amiibo.
+- **PS3 too:** one setting in `SwitchPad.exe` turns the Pi into a wired PS3 pad instead
+  (Cross/Circle/Square/Triangle, L1-R3, PS button). See [SETUP.md](SETUP.md#playstation-3).
 - The Pi software installs itself on first boot. No keyboard or monitor is needed.
-- The PC side is `SwitchPad.exe`: a window (and tray icon) with live status (Pi, Switch,
+- The PC side is `SwitchPad.exe`: a dark-themed window (and tray icon) with live status (Pi, Switch,
   ping graph, a picture of what the Switch receives), a click-to-assign keyboard mapping,
   the Pi's health (temperature, power, Ethernet / Wi-Fi link, USB) with buttons to
   self-test, restart, reboot, update it or collect its logs, and settings. `SwitchPadBridge.exe` is the same as a console program. Both are built with the

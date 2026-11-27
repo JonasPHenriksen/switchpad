@@ -335,6 +335,8 @@ static class Report
         RCLICK = 1 << 11, HOME = 1 << 12, CAPTURE = 1 << 13;
     public const int HAT_CENTER = 8;
     static readonly string[] Names = { "Y", "B", "A", "X", "L", "R", "ZL", "ZR", "-", "+", "LS", "RS", "HOME", "CAPTURE" };
+    // PS3 mode: the Pi sends the same bits as a PS3 pad (Capture has no PS3 button).
+    static readonly string[] Ps3Names = { "Square", "Cross", "Circle", "Triangle", "L1", "R1", "L2", "R2", "Select", "Start", "L3", "R3", "PS", "(Capture)" };
     static readonly string[] HatNames = { "Up", "Up-Right", "Right", "Down-Right", "Down", "Down-Left", "Left", "Up-Left" };
 
     public static byte[] Make(int buttons, int hat, byte lx, byte ly, byte rx, byte ry)
@@ -366,11 +368,12 @@ static class Report
         return pkt;
     }
 
-    public static string Describe(byte[] r)
+    public static string Describe(byte[] r, bool ps3)
     {
         var sb = new StringBuilder();
         int buttons = r[0] | (r[1] << 8);
-        for (int i = 0; i < Names.Length; i++) if ((buttons & (1 << i)) != 0) sb.Append(Names[i]).Append(' ');
+        string[] names = ps3 ? Ps3Names : Names;
+        for (int i = 0; i < names.Length; i++) if ((buttons & (1 << i)) != 0) sb.Append(names[i]).Append(' ');
         if (r[2] < 8) sb.Append("Dpad-").Append(HatNames[r[2]]).Append(' ');
         if (Math.Abs(r[3] - 128) > 20 || Math.Abs(r[4] - 128) > 20) sb.Append("LStick ");
         if (Math.Abs(r[5] - 128) > 20 || Math.Abs(r[6] - 128) > 20) sb.Append("RStick ");
@@ -411,7 +414,7 @@ static class Mapper
 
         int b = 0;
         bool xa = (x & XInput.A) != 0, xb = (x & XInput.B) != 0, xx = (x & XInput.X) != 0, xy = (x & XInput.Y) != 0;
-        if (cfg.Positional)
+        if (cfg.Positional || cfg.Ps3) // PS3 buttons have no letters: always by position (Xbox A -> Cross)
         {
             if (xa) b |= Report.B;
             if (xb) b |= Report.A;
@@ -512,30 +515,36 @@ static class TestScript
 class Target
 {
     public const int BUTTON = 0, DPAD = 1, LSTICK = 2, RSTICK = 3, WALK = 4;
-    public readonly string Id, Label;
+    public readonly string Id, Label, Ps3Label;
     public readonly int Kind, Value; // Value: button bit, or direction 0 up, 1 down, 2 left, 3 right
 
-    public Target(string id, string label, int kind, int value) { Id = id; Label = label; Kind = kind; Value = value; }
+    public Target(string id, string label, int kind, int value, string ps3Label = null)
+    {
+        Id = id; Label = label; Kind = kind; Value = value; Ps3Label = ps3Label ?? label;
+    }
+
+    public string LabelFor(bool ps3) { return ps3 ? Ps3Label : Label; }
 }
 
 static class Targets
 {
     public static readonly Target[] All =
     {
-        new Target("A", "A", Target.BUTTON, Report.A),
-        new Target("B", "B", Target.BUTTON, Report.B),
-        new Target("X", "X", Target.BUTTON, Report.X),
-        new Target("Y", "Y", Target.BUTTON, Report.Y),
-        new Target("L", "L", Target.BUTTON, Report.L),
-        new Target("R", "R", Target.BUTTON, Report.R),
-        new Target("ZL", "ZL", Target.BUTTON, Report.ZL),
-        new Target("ZR", "ZR", Target.BUTTON, Report.ZR),
-        new Target("Plus", "+ (Plus)", Target.BUTTON, Report.PLUS),
-        new Target("Minus", "- (Minus)", Target.BUTTON, Report.MINUS),
-        new Target("Home", "Home", Target.BUTTON, Report.HOME),
-        new Target("Capture", "Capture", Target.BUTTON, Report.CAPTURE),
-        new Target("LS", "Left stick click", Target.BUTTON, Report.LCLICK),
-        new Target("RS", "Right stick click", Target.BUTTON, Report.RCLICK),
+        // The PS3 label is the button in the same spot (the Pi sends Switch A as Circle etc.).
+        new Target("A", "A", Target.BUTTON, Report.A, "Circle"),
+        new Target("B", "B", Target.BUTTON, Report.B, "Cross"),
+        new Target("X", "X", Target.BUTTON, Report.X, "Triangle"),
+        new Target("Y", "Y", Target.BUTTON, Report.Y, "Square"),
+        new Target("L", "L", Target.BUTTON, Report.L, "L1"),
+        new Target("R", "R", Target.BUTTON, Report.R, "R1"),
+        new Target("ZL", "ZL", Target.BUTTON, Report.ZL, "L2"),
+        new Target("ZR", "ZR", Target.BUTTON, Report.ZR, "R2"),
+        new Target("Plus", "+ (Plus)", Target.BUTTON, Report.PLUS, "Start"),
+        new Target("Minus", "- (Minus)", Target.BUTTON, Report.MINUS, "Select"),
+        new Target("Home", "Home", Target.BUTTON, Report.HOME, "PS"),
+        new Target("Capture", "Capture", Target.BUTTON, Report.CAPTURE, "Capture (no PS3 button)"),
+        new Target("LS", "Left stick click", Target.BUTTON, Report.LCLICK, "L3 (left stick click)"),
+        new Target("RS", "Right stick click", Target.BUTTON, Report.RCLICK, "R3 (right stick click)"),
         new Target("DUp", "D-pad up", Target.DPAD, 0),
         new Target("DDown", "D-pad down", Target.DPAD, 1),
         new Target("DLeft", "D-pad left", Target.DPAD, 2),
@@ -891,7 +900,8 @@ class Settings
 {
     public string Pi = "switchpad.local";
     public int Pad = -1;                 // XInput slot, -1 = auto
-    public bool Positional = true;       // layout: true = position, false = label
+    public bool Ps3 = false;             // console: false = Nintendo Switch, true = PS3 (the Pi is told to switch)
+    public bool Positional = true;       // layout: true = position, false = label (Switch only)
     public int TriggerThreshold = 30;    // LT/RT value (0-255) above which ZL/ZR count as pressed
     public int Deadzone = 0;             // percent of stick travel ignored around the centre
     public int Interval = 1;             // minimum ms between packets
@@ -921,11 +931,15 @@ class Settings
 
     public string Summary()
     {
-        return string.Format("Pi {0}, pad {1}, layout {2}, ZL/ZR above {3}, deadzone {4}%, keyboard {5}",
-            Pi, Pad < 0 ? "auto" : Pad.ToString(), Positional ? "position" : "label", TriggerThreshold, Deadzone,
+        return string.Format("{6}, Pi {0}, pad {1}, layout {2}, triggers above {3}, deadzone {4}%, keyboard {5}",
+            Pi, Pad < 0 ? "auto" : Pad.ToString(), Positional || Ps3 ? "position" : "label", TriggerThreshold, Deadzone,
             Keyboard ? string.Format("on (hide mapped keys {0}, remote keys only {1}, walk {2}%)",
-                OnOff(BlockKeys), OnOff(RemoteKeysOnly), WalkPercent) : "off");
+                OnOff(BlockKeys), OnOff(RemoteKeysOnly), WalkPercent) : "off",
+            ConsoleName);
     }
+
+    public string ConsoleName { get { return Ps3 ? "PS3" : "Switch"; } }
+    public string ConsoleId { get { return Ps3 ? "ps3" : "switch"; } }
 
     static string OnOff(bool b) { return b ? "on" : "off"; }
 
@@ -977,6 +991,11 @@ class Settings
         {
             case "pi": if (v.Length > 0) Pi = v; break;
             case "pad": Pad = v.ToLowerInvariant() == "auto" ? -1 : Int(v, 0, 3); break;
+            case "console":
+                v = v.ToLowerInvariant();
+                if (v != "switch" && v != "ps3") throw new FormatException();
+                Ps3 = v == "ps3";
+                break;
             case "layout":
                 v = v.ToLowerInvariant();
                 if (v != "position" && v != "label") throw new FormatException();
@@ -1015,6 +1034,7 @@ class Settings
         sb.AppendLine("# SwitchPad settings. Change them in SwitchPad.exe, or edit this file while SwitchPad is closed.");
         sb.AppendLine("pi=" + Pi);
         sb.AppendLine("pad=" + (Pad < 0 ? "auto" : Pad.ToString(CultureInfo.InvariantCulture)));
+        sb.AppendLine("console=" + ConsoleId);
         sb.AppendLine("layout=" + (Positional ? "position" : "label"));
         sb.AppendLine("trigger_threshold=" + TriggerThreshold);
         sb.AppendLine("deadzone=" + Deadzone);
@@ -1028,6 +1048,7 @@ class Settings
         sb.AppendLine();
         sb.AppendLine("[keys]");
         sb.AppendLine("# Switch input = up to 2 Windows key names, e.g. W, Space, LShiftKey, D1 (the 1 key), NumPad8, Up");
+        sb.AppendLine("# (PS3: A = Circle, B = Cross, X = Triangle, Y = Square, L/R = L1/R1, ZL/ZR = L2/R2, Plus = Start, Minus = Select, Home = PS)");
         foreach (var t in Targets.All) sb.AppendLine(t.Id + "=" + KeyNames.ToText(Keys(t.Id)));
         try
         {
@@ -1100,9 +1121,12 @@ class PiHealth
 
     public string Summary()
     {
-        return string.Format("{0}, SwitchPad {1}, {2}, CPU {3} C, power {4}, USB {5}",
+        string console = this["console"] == "ps3"
+            ? ", PS3 mode (PS button: " + (this["ps_button"].Length > 0 ? this["ps_button"] : "?") + ")"
+            : this["console"] == "switch" ? ", Switch mode" : "";
+        return string.Format("{0}, SwitchPad {1}, {2}, CPU {3} C, power {4}, USB {5}{6}",
             this["model"], this["sw"], this["link_text"], this["temp"].Length > 0 ? this["temp"] : "?",
-            this["power_text"], this["usb"]);
+            this["power_text"], this["usb"], console);
     }
 }
 
@@ -1522,10 +1546,12 @@ class Engine
         double onlineSince = -1;
         PiHealth lastHealth = null;
         string healthKey = null;
+        double lastConsoleCmdMs = -100000;
+        bool warnedOldPi = false;
 
         Settings c0 = Cfg;
         Log.Write(string.Format("Sending to the Pi at {0} ({1}, {2}, keyboard {3}, min interval {4} ms).{5}", c0.Pi,
-            TestForever ? "TEST PATTERN" : "layout " + (c0.Positional ? "position" : "label"),
+            c0.ConsoleName + ", " + (TestForever ? "TEST PATTERN" : "layout " + (c0.Positional || c0.Ps3 ? "position" : "label")),
             c0.Pad >= 0 ? "pad " + c0.Pad : "pad auto", c0.Keyboard ? "on" : "off", c0.Interval,
             ConsoleStatus ? " Ctrl+C to quit." : ""));
 
@@ -1582,7 +1608,7 @@ class Engine
             }
 
             // Every button / D-pad change goes into the log file (sticks are summarized in stats).
-            string buttons = ButtonsOnly(report);
+            string buttons = ButtonsOnly(report, cfg.Ps3);
             if (buttons != lastButtons) { Log.Write("input: " + buttons, false); lastButtons = buttons; }
 
             // Send on change (at most every `interval` ms, always the newest state),
@@ -1612,8 +1638,29 @@ class Engine
             {
                 lastHealth = health;
                 // logged when something that matters changes (not every temperature wiggle)
-                string key = health["sw"] + "|" + health["link"] + "|" + health["dev"] + "|" + health["power"] + "|" + health["usb"];
+                string key = health["sw"] + "|" + health["link"] + "|" + health["dev"] + "|" + health["power"] + "|" +
+                             health["usb"] + "|" + health["console"] + "|" + health["ps_button"];
                 if (key != healthKey) { healthKey = key; Log.Write("Pi health: " + health.Summary()); }
+            }
+            // The console is a setting on the PC; the Pi keeps its own copy on the SD card. Tell it
+            // whenever the two differ (it answers in its health, every 2 s).
+            if (health != null && Link.Online && Clock.Ms - health.ReceivedMs < 5000)
+            {
+                string piConsole = health["console"];
+                if (piConsole.Length == 0)
+                {
+                    if (cfg.Ps3 && !warnedOldPi)
+                    {
+                        warnedOldPi = true;
+                        Log.Write("The Pi's SwitchPad is older than this PC's and has no PS3 mode: use Update Pi.");
+                        AddCommandLine("error: the Pi's SwitchPad has no PS3 mode yet. Use Update Pi.");
+                    }
+                }
+                else if (piConsole != cfg.ConsoleId && Clock.Ms - lastConsoleCmdMs >= 6000)
+                {
+                    lastConsoleCmdMs = Clock.Ms;
+                    Command("console " + cfg.ConsoleId);
+                }
             }
             foreach (var r in Link.TakeReplies())
             {
@@ -1623,21 +1670,21 @@ class Engine
             if (wasOnline && Link.SwitchAttached != wasAttached)
             {
                 wasAttached = Link.SwitchAttached;
-                Log.Write(wasAttached ? "Pi reports: Switch/PC is using the controller (USB configured)"
-                                      : "Pi reports: Switch NOT connected on USB");
+                Log.Write(wasAttached ? "Pi reports: the console/PC is using the controller (USB configured)"
+                                      : "Pi reports: console NOT connected on USB");
             }
 
             if (now - lastStats >= 10000)
             {
                 var s = Link.Stats;
                 Log.Write(string.Format(
-                    "stats {0:0}s: {1} | Switch: {2} | pad slot {3} (slots {4}) | keyboard {5} | sent {6}, send errors {7}, " +
+                    "stats {0:0}s: {1} | " + cfg.ConsoleName + ": {2} | pad slot {3} (slots {4}) | keyboard {5} | sent {6}, send errors {7}, " +
                     "changes {8} | status msgs from Pi {9} | round trip PC-Pi-PC {10} | max send {11} ms, slow sends {12} | " +
                     "max loop {13} ms | holding: {14} | Pi: {15}",
                     (now - lastStats) / 1000.0, Link.Status,
                     Link.Online ? (Link.SwitchAttached ? "connected" : "not connected") : "?",
                     pad, slots, cfg.Keyboard ? "on" : "off", s.Sent, s.SendErrors, changes, s.StatusRx,
-                    s.Rtt.TakeSummary(), maxSendMs, slowSends, maxLoopMs, Report.Describe(report),
+                    s.Rtt.TakeSummary(), maxSendMs, slowSends, maxLoopMs, Report.Describe(report, cfg.Ps3),
                     health != null && Clock.Ms - health.ReceivedMs < 10000
                         ? "cpu " + health["temp"] + " C, " + health["link_text"] + ", power " + health["power"]
                         : "no health info"), false);
@@ -1688,11 +1735,11 @@ class Engine
             {
                 lastPrint = now;
                 double rtt = Link.Stats.Rtt.Smooth;
-                Con.Status(string.Format("{0} | Switch: {1} | Ping: {2} | Pressed: {3}",
+                Con.Status(string.Format("{0} | {4}: {1} | Ping: {2} | Pressed: {3}",
                     Link.Status,
                     Link.Online ? (Link.SwitchAttached ? "connected" : "not connected") : "?",
                     Link.Online && rtt >= 0 ? string.Format("{0:0} ms", rtt) : "?",
-                    Report.Describe(report)));
+                    Report.Describe(report, cfg.Ps3), cfg.ConsoleName));
             }
             Thread.Sleep(1);
         }
@@ -1700,18 +1747,18 @@ class Engine
         for (int i = 0; i < 5; i++) { Link.Send(Report.Neutral()); Thread.Sleep(10); } // release everything
     }
 
-    static string ButtonsOnly(byte[] r)
+    static string ButtonsOnly(byte[] r, bool ps3)
     {
         var copy = (byte[])r.Clone();
         copy[3] = copy[4] = copy[5] = copy[6] = 128; // ignore sticks
-        return Report.Describe(copy);
+        return Report.Describe(copy, ps3);
     }
 }
 
 // Helpers shared by both programs.
 static class Bridge
 {
-    public const string Version = "2026-11-24b (window, keyboard, Pi health + controls)";
+    public const string Version = "2026-11-27 (window, keyboard, Pi health + controls, PS3 mode)";
 
     // Only one SwitchPad.exe / SwitchPadBridge.exe at a time: two would fight over the controller.
     public static Mutex SingleInstance()
@@ -1782,15 +1829,19 @@ static class Program
 {
     const string Usage =
 @"SwitchPadBridge - console version of SwitchPad.exe. Sends an Xbox/XInput pad and the keyboard
-to the SwitchPad Pi (Nintendo Switch). It uses settings.ini (made by SwitchPad.exe) if there is
-one; the options below override it for this run.
+to the SwitchPad Pi (Nintendo Switch or PS3). It uses settings.ini (made by SwitchPad.exe) if
+there is one; the options below override it for this run.
 
 Usage: SwitchPadBridge.exe [options]
   --pi HOST       the Pi's IP address or name (default: switchpad.local).
                   The IP address is faster, e.g. --pi 192.168.137.79
   --pad N         XInput slot 0-3 to read (default: auto = highest connected slot)
+  --console C     switch (default) or ps3. The Pi switches its USB side to match (the
+                  controller reconnects for a second) and keeps that until told otherwise.
+                  PS3: Xbox A/B/X/Y -> Cross/Circle/Square/Triangle, LB/RB -> L1/R1,
+                  LT/RT -> L2/R2, Back/Start -> Select/Start, Guide or Back+Start -> PS.
   --layout L      position (default): Xbox A/B/X/Y -> Switch B/A/Y/X (same physical spot)
-                  label: Xbox A/B/X/Y -> Switch A/B/X/Y (same letter)
+                  label: Xbox A/B/X/Y -> Switch A/B/X/Y (same letter). Switch only.
   --no-keyboard   ignore the keyboard
   --interval MS   minimum time between packets (default: 1)
   --test          send a scripted test pattern instead of reading a pad
@@ -1814,6 +1865,12 @@ Enter = +, Backspace = -, H = HOME, F12 = CAPTURE. Change them in SwitchPad.exe.
                 {
                     case "--pi": case "--wifi": cfg.Pi = args[++i]; break; // --wifi: older name
                     case "--pad": cfg.Pad = int.Parse(args[++i]); if (cfg.Pad < 0 || cfg.Pad > 3) throw new FormatException(); break;
+                    case "--console":
+                        string c = args[++i].ToLowerInvariant();
+                        if (c == "switch") cfg.Ps3 = false;
+                        else if (c == "ps3") cfg.Ps3 = true;
+                        else throw new FormatException();
+                        break;
                     case "--layout":
                         string l = args[++i].ToLowerInvariant();
                         if (l == "position") cfg.Positional = true;

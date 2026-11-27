@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""SwitchPad - turns a Raspberry Pi Zero W into a wired Nintendo Switch controller.
+"""SwitchPad - turns a Raspberry Pi Zero W into a wired Nintendo Switch (or PS3) controller.
 
 The Pi presents itself over its "USB" port as a simple wired pad (HORI Pokken
 style HID, no motion/rumble). Button/stick states arrive from SwitchPad.exe /
 SwitchPadBridge.exe on the Windows PC over the network (Wi-Fi or Ethernet, UDP port 5005).
 The Pi answers with its status, its health (temperature, power, network, USB) and
-the results of commands from the PC (self-test, restart, reboot).
+the results of commands from the PC (self-test, restart, reboot, console).
+
+PS3 mode: the same 8-byte input from the PC is turned into a HORI-style PS3 pad report
+(PS3-compatible HID with button pressures). The PC switches modes with the "console"
+command; the choice is kept as an empty file named 'ps3' next to this file.
 
 Commands (run as root):
   switchpad.py run        set up the USB gadget and forward input (systemd uses this)
@@ -18,6 +22,7 @@ Logs: switchpad.log next to this file (on the SD card), the journal, and the HDM
 An empty file named 'fullspeed' next to this file makes the USB side full-speed only.
 """
 import errno
+import fcntl
 import math
 import os
 import queue
@@ -32,7 +37,7 @@ import threading
 import time
 import traceback
 
-VERSION = "2026-11-24"   # shown in SwitchPad.exe's Pi tab
+VERSION = "2026-11-27"   # shown in SwitchPad.exe's Pi tab
 
 GADGET = "/sys/kernel/config/usb_gadget/switchpad"
 HIDG = "/dev/hidg0"
@@ -43,7 +48,8 @@ MAGIC_STATUS = b"SWS1"   # Pi -> PC: magic(4) + switch_attached(1) + version 1 (
                          # = 16 bytes. The echo lets the PC measure the link's round-trip time.
                          # Unchanged since v1, so older PC software keeps working.
 MAGIC_HEALTH = b"SWH1"   # Pi -> PC every 2 s: magic + UTF-8 "key=value" lines (see health_msg)
-MAGIC_CMD = b"SWC1"      # PC -> Pi: magic + nonce uint32 LE + command text (ping, selftest, restart, reboot)
+MAGIC_CMD = b"SWC1"      # PC -> Pi: magic + nonce uint32 LE + command text
+                         # (ping, selftest, restart, reboot, "console switch", "console ps3")
 MAGIC_REPLY = b"SWR1"    # Pi -> PC: magic + that nonce + reply text, starting "ok", "done" or "error"
 FAILSAFE_S = 0.5         # release everything if the PC goes quiet this long
 GAP_S = 0.15             # the PC sends at least every 50 ms; a longer silence is a network hiccup
@@ -95,6 +101,87 @@ REPORT_DESC = bytes([
     0xC0,              # End Collection
 ])
 
+# HID report descriptor for PS3 mode: the layout of HORI's wired PS3 pads, which the PS3 takes
+# as a game pad. Input report (27 bytes): 13 buttons (Square, Cross, Circle, Triangle, L1, R1,
+# L2, R2, Select, Start, L3, R3, PS) + 3 padding bits, hat, LX, LY, RX, RY, 12 button
+# pressures, 4 x 16-bit motion values (sent centred: no motion). The 8-byte feature report
+# 0x2621 is what the PS3 asks for before it lets the PS button work (PS3_MAGIC below).
+PS3_REPORT_DESC = bytes([
+    0x05, 0x01,        # Usage Page (Generic Desktop)
+    0x09, 0x05,        # Usage (Game Pad)
+    0xA1, 0x01,        # Collection (Application)
+    0x15, 0x00,        #   Logical Minimum (0)
+    0x25, 0x01,        #   Logical Maximum (1)
+    0x35, 0x00,        #   Physical Minimum (0)
+    0x45, 0x01,        #   Physical Maximum (1)
+    0x75, 0x01,        #   Report Size (1)
+    0x95, 0x0D,        #   Report Count (13)
+    0x05, 0x09,        #   Usage Page (Button)
+    0x19, 0x01,        #   Usage Minimum (1)
+    0x29, 0x0D,        #   Usage Maximum (13)
+    0x81, 0x02,        #   Input (Data,Var,Abs)
+    0x95, 0x03,        #   Report Count (3)
+    0x81, 0x01,        #   Input (Const) - 3 bit padding
+    0x05, 0x01,        #   Usage Page (Generic Desktop)
+    0x25, 0x07,        #   Logical Maximum (7)
+    0x46, 0x3B, 0x01,  #   Physical Maximum (315)
+    0x75, 0x04,        #   Report Size (4)
+    0x95, 0x01,        #   Report Count (1)
+    0x65, 0x14,        #   Unit (Degrees)
+    0x09, 0x39,        #   Usage (Hat Switch)
+    0x81, 0x42,        #   Input (Data,Var,Abs,Null)
+    0x65, 0x00,        #   Unit (None)
+    0x95, 0x01,        #   Report Count (1)
+    0x81, 0x01,        #   Input (Const) - 4 bit padding
+    0x26, 0xFF, 0x00,  #   Logical Maximum (255)
+    0x46, 0xFF, 0x00,  #   Physical Maximum (255)
+    0x09, 0x30,        #   Usage (X)
+    0x09, 0x31,        #   Usage (Y)
+    0x09, 0x32,        #   Usage (Z)
+    0x09, 0x35,        #   Usage (Rz)
+    0x75, 0x08,        #   Report Size (8)
+    0x95, 0x04,        #   Report Count (4)
+    0x81, 0x02,        #   Input (Data,Var,Abs)
+    0x06, 0x00, 0xFF,  #   Usage Page (Vendor Defined 0xFF00)
+    0x09, 0x20,        #   Usage (0x20) - pressure: D-pad right
+    0x09, 0x21,        #   Usage (0x21) - D-pad left
+    0x09, 0x22,        #   Usage (0x22) - D-pad up
+    0x09, 0x23,        #   Usage (0x23) - D-pad down
+    0x09, 0x24,        #   Usage (0x24) - Triangle
+    0x09, 0x25,        #   Usage (0x25) - Circle
+    0x09, 0x26,        #   Usage (0x26) - Cross
+    0x09, 0x27,        #   Usage (0x27) - Square
+    0x09, 0x28,        #   Usage (0x28) - L1
+    0x09, 0x29,        #   Usage (0x29) - R1
+    0x09, 0x2A,        #   Usage (0x2A) - L2
+    0x09, 0x2B,        #   Usage (0x2B) - R2
+    0x95, 0x0C,        #   Report Count (12)
+    0x81, 0x02,        #   Input (Data,Var,Abs)
+    0x0A, 0x21, 0x26,  #   Usage (0x2621)
+    0x95, 0x08,        #   Report Count (8)
+    0xB1, 0x02,        #   Feature (Data,Var,Abs)
+    0x0A, 0x21, 0x26,  #   Usage (0x2621)
+    0x91, 0x02,        #   Output (Data,Var,Abs)
+    0x26, 0xFF, 0x03,  #   Logical Maximum (1023)
+    0x46, 0xFF, 0x03,  #   Physical Maximum (1023)
+    0x09, 0x2C,        #   Usage (0x2C) - motion
+    0x09, 0x2D,        #   Usage (0x2D)
+    0x09, 0x2E,        #   Usage (0x2E)
+    0x09, 0x2F,        #   Usage (0x2F)
+    0x75, 0x10,        #   Report Size (16)
+    0x95, 0x04,        #   Report Count (4)
+    0x81, 0x02,        #   Input (Data,Var,Abs)
+    0xC0,              # End Collection
+])
+# The PS3 reads feature report 0 (GET_REPORT, wValue 0x0300) and only lets the PS button
+# work when the pad answers with these 8 bytes.
+PS3_MAGIC = bytes([0x21, 0x26, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00])
+
+# Linux f_hid (kernel 6.12+): GADGET_HID_WRITE_GET_REPORT = _IOW('g', 0x42, struct usb_hidg_report)
+# struct usb_hidg_report { u8 report_id; u8 userspace_req; u16 length; u8 data[64]; u8 padding[4]; }
+HIDG_REPORT_FMT = "<BBH64s4x"
+GADGET_HID_WRITE_GET_REPORT = (1 << 30) | (struct.calcsize(HIDG_REPORT_FMT) << 16) | (ord("g") << 8) | 0x42
+
 # Button bits in the report
 Y, B, A, X, L, R, ZL, ZR, MINUS, PLUS, LCLICK, RCLICK, HOME, CAPTURE = [1 << i for i in range(14)]
 HAT_CENTER = 8
@@ -105,6 +192,36 @@ def make_report(buttons=0, hat=HAT_CENTER, lx=128, ly=128, rx=128, ry=128):
 
 
 NEUTRAL = make_report()
+
+# Pokken button bits are already in the PS3 order (Y=Square, B=Cross, A=Circle, X=Triangle, L=L1,
+# R=R1, ZL=L2, ZR=R2, -=Select, +=Start, LS=L3, RS=R3, HOME=PS); Capture has no PS3 button.
+PS3_BUTTONS = 0x1FFF
+# Pressure bytes in report order, as button bits (D-pad ones come from the hat).
+PS3_PRESSURE_BITS = (X, A, B, Y, L, R, ZL, ZR)
+PS3_MOTION = struct.pack("<HHHH", 512, 512, 512, 512)
+
+
+def to_ps3(report):
+    """The PC's 8-byte (Switch) report as a 27-byte PS3 report."""
+    buttons, hat, lx, ly, rx, ry = struct.unpack_from("<HBBBBB", report)
+    if hat > 7:
+        hat = HAT_CENTER
+    up, right = hat in (7, 0, 1), hat in (1, 2, 3)
+    down, left = hat in (3, 4, 5), hat in (5, 6, 7)
+    pressure = [255 if d else 0 for d in (right, left, up, down)]
+    pressure += [255 if buttons & bit else 0 for bit in PS3_PRESSURE_BITS]
+    return (struct.pack("<HBBBBB", buttons & PS3_BUTTONS, hat, lx, ly, rx, ry)
+            + bytes(pressure) + PS3_MOTION)
+
+
+# The console the USB gadget is set up for right now ("switch" or "ps3"), and whether the PS3's
+# PS-button request can be answered (PS3 mode only).
+CONSOLE = "switch"
+PS_BUTTON = ""
+
+
+def to_usb(report):
+    return to_ps3(report) if CONSOLE == "ps3" else report
 
 
 def test_pattern(t):
@@ -228,9 +345,60 @@ def read_attr(path):
 
 # ---------------------------------------------------------------- USB gadget
 
+def card_file(name):
+    """A settings file next to switchpad.py on the SD card ('fullspeed', 'ps3'), or None."""
+    return os.path.join(os.path.dirname(LOG_FILE), name) if LOG_FILE else None
+
+
+def wanted_console():
+    """An empty file named 'ps3' next to switchpad.py on the SD card = PS3 mode."""
+    path = card_file("ps3")
+    return "ps3" if path and os.path.exists(path) else "switch"
+
+
+def save_console(console):
+    path = card_file("ps3")
+    if not path:
+        raise OSError("no SwitchPad folder on the SD card to keep the setting in")
+    if console == "ps3":
+        with open(path, "w") as f:
+            os.fsync(f.fileno())  # the Pi is switched off by unplugging
+    elif os.path.exists(path):
+        os.remove(path)
+    os.sync()
+
+
+def gadget_report_desc():
+    try:
+        with open(os.path.join(GADGET, "functions/hid.usb0/report_desc"), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def teardown_gadget():
+    """Remove the configfs gadget (to set it up again for the other console)."""
+    g = lambda rel: os.path.join(GADGET, rel)
+    if read_attr(g("UDC")):
+        write_attr(g("UDC"), "")
+    link = g("configs/c.1/hid.usb0")
+    if os.path.islink(link):
+        os.unlink(link)
+    for rel in ("configs/c.1/strings/0x409", "configs/c.1", "functions/hid.usb0", "strings/0x409", ""):
+        if os.path.isdir(g(rel)):
+            os.rmdir(g(rel))
+
+
 def setup_gadget():
-    """Create the USB HID gadget via configfs (idempotent)."""
+    """Create the USB HID gadget via configfs for the wanted console (idempotent)."""
+    global CONSOLE
     subprocess.run(["modprobe", "libcomposite"], check=False)
+    want = wanted_console()
+    desc = PS3_REPORT_DESC if want == "ps3" else REPORT_DESC
+    if os.path.isdir(GADGET) and gadget_report_desc() != desc:
+        log("USB gadget: setting it up again for %s mode" % ("PS3" if want == "ps3" else "Switch"))
+        teardown_gadget()
+    CONSOLE = want
     if os.path.isdir(GADGET):
         udc = read_attr(os.path.join(GADGET, "UDC"))
         if udc:
@@ -244,6 +412,8 @@ def setup_gadget():
     else:
         g = lambda rel: os.path.join(GADGET, rel)
         os.makedirs(GADGET)
+        # The same identity in both modes: the PS3 takes any HID game pad; only the report
+        # descriptor (and with it the report format) changes.
         write_attr(g("idVendor"), "0x0f0d")   # HORI
         write_attr(g("idProduct"), "0x0092")  # Pokken Tournament controller
         write_attr(g("bcdDevice"), "0x0572")
@@ -258,7 +428,7 @@ def setup_gadget():
         write_attr(os.path.join(func, "protocol"), "0")
         write_attr(os.path.join(func, "subclass"), "0")
         write_attr(os.path.join(func, "report_length"), "64")
-        write_attr(os.path.join(func, "report_desc"), REPORT_DESC)
+        write_attr(os.path.join(func, "report_desc"), desc)
 
         cfg = g("configs/c.1")
         os.makedirs(os.path.join(cfg, "strings/0x409"))
@@ -273,14 +443,32 @@ def setup_gadget():
                            "'dtoverlay=dwc2,dr_mode=peripheral' and that you rebooted.")
     apply_usb_speed()
     write_attr(os.path.join(GADGET, "UDC"), udcs[0])
-    log("USB gadget bound to %s (max speed: %s)"
-        % (udcs[0], read_attr(os.path.join(GADGET, "max_speed")) or "default"))
+    log("USB gadget bound to %s (%s mode, max speed: %s)"
+        % (udcs[0], "PS3" if CONSOLE == "ps3" else "Switch",
+           read_attr(os.path.join(GADGET, "max_speed")) or "default"))
+
+
+def answer_ps3_magic(fd):
+    """PS3 mode: hand the kernel the answer to the PS3's feature-report request, so the PS button
+    works. Needs a kernel whose f_hid takes GET_REPORT answers from user space (6.12 or newer).
+    Returns the text for the Pi tab."""
+    buf = struct.pack(HIDG_REPORT_FMT, 0, 0, len(PS3_MAGIC), PS3_MAGIC)
+    try:
+        fcntl.ioctl(fd, GADGET_HID_WRITE_GET_REPORT, buf)
+        log("PS3: the PS button's handshake answer is set")
+        return "ok"
+    except OSError as e:
+        log("PS3: this kernel (%s) can't answer the PS3's handshake (%s). Everything works except "
+            "the PS button; 'sudo apt full-upgrade' on the Pi may bring a newer kernel."
+            % (os.uname().release, errno.errorcode.get(e.errno, e.errno)))
+        return "not supported by kernel %s" % os.uname().release
 
 
 def wanted_usb_speed():
     """An empty file named 'fullspeed' next to switchpad.py on the SD card forces full-speed USB
     (what the real HORI pad uses). Helps with hubs/docks that don't like the Pi's high-speed."""
-    if LOG_FILE and os.path.exists(os.path.join(os.path.dirname(LOG_FILE), "fullspeed")):
+    path = card_file("fullspeed")
+    if path and os.path.exists(path):
         return "full-speed"
     return "high-speed"
 
@@ -464,11 +652,13 @@ def health_loop():
 
 
 BUTTON_NAMES = ["Y", "B", "A", "X", "L", "R", "ZL", "ZR", "-", "+", "LS", "RS", "HOME", "CAPTURE"]
+PS3_NAMES = ["Square", "Cross", "Circle", "Triangle", "L1", "R1", "L2", "R2", "Select", "Start",
+             "L3", "R3", "PS", "(Capture)"]
 
 
 def describe(report):
     b, hat = struct.unpack_from("<HB", report)
-    names = [n for i, n in enumerate(BUTTON_NAMES) if b & (1 << i)]
+    names = [n for i, n in enumerate(PS3_NAMES if CONSOLE == "ps3" else BUTTON_NAMES) if b & (1 << i)]
     if hat < 8:
         names.append("Dpad%d" % hat)
     return " ".join(names) or "-"
@@ -522,6 +712,7 @@ def try_setup_gadget():
 
 
 def run():
+    global PS_BUTTON
     rotate_log()
     log("=== SwitchPad %s starting (%s, Python %s, %s, power: %s, network: %s) ==="
         % (VERSION, os.path.abspath(__file__), sys.version.split()[0], PI_MODEL, throttled(),
@@ -569,6 +760,7 @@ def run():
             ("rx", tot["rx"]), ("lost", tot["lost"]), ("late", tot["late"]),
             ("hiccups", tot["gaps"]), ("failsafe", tot["failsafe"]), ("usb_err", tot["hid_err"]),
             ("selftest", "running" if selftest else health["selftest"]),
+            ("console", CONSOLE), ("ps_button", PS_BUTTON if CONSOLE == "ps3" else ""),
         ]
         text = "".join("%s=%s\n" % (k, str(v).replace("\n", " ")) for k, v in fields)
         return MAGIC_HEALTH + text.encode("utf-8")
@@ -576,6 +768,7 @@ def run():
     # ---- commands from the PC (SwitchPad.exe's Pi tab) ----
     recent_cmds = {}  # nonce -> reply: a resent command gets the same answer, not a second run
     selftest = None   # the running self-test: dict(nonce, addr, ok0, err0, start)
+    regadget = False  # "console" command: set the USB gadget up again for the other console
 
     def reply(nonce, text, addr):
         try:
@@ -584,7 +777,7 @@ def run():
             pass
 
     def handle_command(data, addr, now):
-        nonlocal selftest
+        nonlocal selftest, regadget
         nonce = struct.unpack_from("<I", data, 4)[0]
         cmd = data[8:].decode("utf-8", "replace").strip().lower()
         if nonce in recent_cmds:
@@ -601,9 +794,9 @@ def run():
             if selftest:
                 text = "error: a self-test is already running"
             elif br.hid is None or last_usb != "configured":
-                text = ("error: the Switch isn't using the controller (USB state: %s), so there "
-                        "is nothing to test. Check the cable and that the Switch is docked and awake."
-                        % last_usb)
+                text = ("error: the console isn't using the controller (USB state: %s), so there "
+                        "is nothing to test. Check the cable and that the console is on (Switch: "
+                        "docked and awake)." % last_usb)
             else:
                 selftest = dict(nonce=nonce, addr=addr, ok0=br.total["hid_ok"],
                                 err0=br.total["hid_err"], start=now)
@@ -616,6 +809,21 @@ def run():
         elif cmd == "reboot":
             text = "ok: rebooting the Pi (back in about 30-60 s)"
             after = ["systemctl", "reboot"]
+        elif cmd in ("console switch", "console ps3"):
+            want = cmd.split()[1]
+            name = "PS3" if want == "ps3" else "Switch"
+            if selftest:
+                text = "error: a self-test is running; try again when it has finished"
+            elif want == CONSOLE and wanted_console() == want:
+                text = "ok: already in %s mode" % name
+            else:
+                try:
+                    save_console(want)
+                    regadget = True
+                    text = ("ok: switching to %s mode; the controller reconnects to the console "
+                            "in a second" % name)
+                except OSError as e:
+                    text = "error: could not save the %s setting on the SD card: %s" % (name, e)
         else:
             text = "error: unknown command %r (this Pi runs SwitchPad %s)" % (cmd, VERSION)
         recent_cmds[nonce] = text
@@ -657,6 +865,15 @@ def run():
         loop_max = max(loop_max, now - prev_iter)
         prev_iter = now
 
+        if regadget:  # the PC switched the console: new USB identity, the host sees a replug
+            regadget = False
+            if br.hid is not None:
+                os.close(br.hid)
+                br.hid = None
+            gadget_ok = try_setup_gadget()
+            gadget_next_try = now + 5.0
+            br.hid_retry_at = 0.0
+            br.dirty = True
         if not gadget_ok and now >= gadget_next_try:
             gadget_ok = try_setup_gadget()
             gadget_next_try = now + 5.0
@@ -664,6 +881,8 @@ def run():
             try:
                 br.hid = os.open(HIDG, os.O_RDWR | os.O_NONBLOCK)
                 log("Opened %s" % HIDG)
+                if CONSOLE == "ps3":
+                    PS_BUTTON = answer_ps3_magic(br.hid)
             except OSError as e:
                 br.hid_retry_at = now + 2.0
                 if br.last_hid_err != "open":
@@ -735,7 +954,7 @@ def run():
                 pass
         if br.hid is not None and br.hid in w and br.dirty:
             try:
-                os.write(br.hid, br.latest)
+                os.write(br.hid, to_usb(br.latest))
                 br.dirty = False
                 br.count("hid_ok")
                 d = now - br.dirty_since  # time from arriving at the Pi to handed to USB
@@ -766,7 +985,7 @@ def run():
             st = usb_state()
             if st != last_usb:
                 log("USB state: %s -> %s%s" % (last_usb, st,
-                    "  (the Switch/PC is using the controller)" if st == "configured" else ""))
+                    "  (the console/PC is using the controller)" if st == "configured" else ""))
                 last_usb = st
 
         # --- status back to the PC, twice a second ---
@@ -810,17 +1029,22 @@ def selftest():
     """Press L+R three times (registers the pad on 'Change Grip/Order'), then move things."""
     setup_gadget()
     fd = os.open(HIDG, os.O_RDWR)
+    if CONSOLE == "ps3":
+        answer_ps3_magic(fd)
 
     def send(report, hold):
         _, w, _ = select.select([], [fd], [], 2.0)
         if not w:
-            log("The Switch isn't reading the controller. Is the cable in the Pi's 'USB' port "
+            log("The console isn't reading the controller. Is the cable in the Pi's 'USB' port "
                 "(not 'PWR') and is it a data cable?")
             sys.exit(1)
-        os.write(fd, report)
+        os.write(fd, to_usb(report))
         time.sleep(hold)
 
-    log("Self-test: open System Settings > Controllers > Change Grip/Order on the Switch.")
+    if CONSOLE == "ps3":
+        log("Self-test (PS3 mode): L1+R1 three times, D-pad right and left, left stick circle.")
+    else:
+        log("Self-test: open System Settings > Controllers > Change Grip/Order on the Switch.")
     for i in range(3):
         log("  L+R (%d/3)" % (i + 1))
         send(make_report(L | R), 0.5)
@@ -835,7 +1059,7 @@ def selftest():
         a = step / 60.0 * 2 * math.pi
         send(make_report(lx=int(128 + 127 * math.cos(a)), ly=int(128 - 127 * math.sin(a))), 0.03)
     send(NEUTRAL, 0.1)
-    log("Self-test done. If the Switch showed the controller, the USB side works.")
+    log("Self-test done. If the console showed the controller, the USB side works.")
 
 
 # ---------------------------------------------------------------- full diagnostics report
@@ -855,6 +1079,7 @@ REPORT_CMDS = [
     ("usb gadget", "for f in /sys/class/udc/*/state /sys/class/udc/*/current_speed "
                    "/sys/kernel/config/usb_gadget/switchpad/{idVendor,idProduct,max_speed,UDC}; "
                    "do echo \"$f: $(cat $f 2>&1)\"; done; ls -l /dev/hidg* 2>&1; "
+                   "echo \"report_desc: $(od -An -tx1 /sys/kernel/config/usb_gadget/switchpad/functions/hid.usb0/report_desc 2>&1 | head -2 | tr -s ' \\n' ' ')...\"; "
                    "ls /boot/firmware/switchpad/"),
     ("config.txt (dwc2, disable-bt) and cmdline.txt",
      "grep -nE 'dwc2|disable-bt|disable-wifi' /boot/firmware/config.txt; cat /boot/firmware/cmdline.txt"),
@@ -907,7 +1132,8 @@ def main():
         selftest()
     elif cmd == "status":
         setup_gadget()
-        print("Switch attached" if switch_attached() else "Switch NOT attached")
+        name = "PS3" if CONSOLE == "ps3" else "Switch"
+        print("%s attached" % name if switch_attached() else "%s NOT attached" % name)
     else:
         sys.exit(__doc__)
 

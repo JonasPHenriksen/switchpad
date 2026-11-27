@@ -15,6 +15,7 @@ Only one of them can run at a time. Both keep their settings in `windows\setting
 
 The Pi shows up on the Switch as a plain wired pad (HORI Pokken style). That means
 no motion controls, no rumble and no amiibo. Every normal button and stick works.
+It can also act as a **PS3** pad instead: see [PlayStation 3](#playstation-3).
 
 > **Why not Bluetooth?** We tried it first. On this hardware the PC ↔ Pi Bluetooth link kept
 > disconnecting every few seconds, and it simply isn't worth the effort to make it work
@@ -134,8 +135,8 @@ Delete that file to go back.
   the last minute, and details: the last key pressed and whether it came from Parsec.
 - **Keyboard:** the key mapping (below).
 - **Pi:** the Pi's health and buttons to test, restart or update it (below).
-- **Settings:** Pi address and **Find Pi**, controller slot, button layout, ZL/ZR trigger
-  point, stick deadzone, startup, and the test pattern.
+- **Settings:** Pi address and **Find Pi**, controller slot, console (Switch or PS3), button
+  layout, trigger point, stick deadzone, startup, and the test pattern.
 - **Log:** everything that's also written to the log file.
 
 The tray icon's colour tells you the state at a glance: **green** = all good, **yellow** =
@@ -152,7 +153,8 @@ tray at every sign-in; "Start minimized to the tray" does that for manual starts
 - **CPU temperature** (amber from 70 °C, red from 80 °C, where the Pi slows itself down),
 - **power**: "UNDER-VOLTAGE NOW" in red means the power supply or cable is too weak, which
   makes USB and the network unreliable. The Pi box at the top then also says **Low power!**,
-- **USB to the Switch**: in use, not connected, or suspended (Switch asleep),
+- **USB to the console**: in use, not connected, or suspended (console asleep),
+- **Console mode**: Switch or PS3, and in PS3 mode whether the PS button works,
 - how long the Pi and SwitchPad have been running, packets received / lost from the PC,
   network gaps, failsafe releases and USB write errors since SwitchPad started.
 
@@ -222,6 +224,51 @@ Options on the Keyboard tab:
 
 A controller and the keyboard can be used together. While a stick's keys are held, they
 override that stick.
+
+## PlayStation 3
+
+The same Pi can be a wired PS3 pad. Nothing changes on the Pi's SD card by hand and no
+extra hardware is needed: the PS3 accepts ordinary USB game pads.
+
+1. The Pi needs SwitchPad from 2026-11-27 or newer: click **Update Pi…** on the Pi tab once.
+   (With an older one, the Pi tab says so.)
+2. In `SwitchPad.exe` → **Settings → Console**, choose **PlayStation 3**. The Pi switches
+   its USB side within a second or two and keeps PS3 mode until you switch back, also after
+   a reboot. The Pi tab shows **Console mode: PS3**. (Console version: `--console ps3`.
+   `SwitchPadBridge.exe` and `SwitchPad.exe` always set the Pi to their own console setting.)
+3. Connect the Pi's **USB** port (Pi 4: the USB-C port) to a USB port on the PS3. The PS3
+   powers the Pi; give it about 40 s to boot. A Pi Zero W is fine on a PS3 port. A Pi 4 needs
+   more power than a PS3 port is meant to give: if the Pi tab shows **Low power!**, that's why.
+4. Play as usual. **Settings → Send test pattern** presses L1+R1, the D-pad and the left stick.
+
+| Xbox (guest) | PS3 |
+|---|---|
+| A / B / X / Y | Cross / Circle / Square / Triangle (same physical spot) |
+| LB / RB | L1 / R1 |
+| LT / RT | L2 / R2 |
+| Back / Start | Select / Start |
+| Stick clicks | L3 / R3 |
+| Guide, or Back+Start | PS |
+
+The keyboard works the same; the Keyboard tab shows the PS3 names (default K / J / I / U =
+Circle / Cross / Triangle / Square, H = PS). Capture has no PS3 button and does nothing.
+**Button layout** only applies to the Switch: PlayStation buttons have no letters, so it's
+always by position.
+
+**The PS button** needs the Pi to answer a handshake the PS3 sends to non-Sony pads. That
+needs a recent Linux kernel on the Pi (6.12 or newer). The Pi tab shows either
+**PS3 (PS button works)** or **PS button: not supported by kernel …**. In the second case
+everything else still works in games; to fix it, update the Pi's system over SSH and reboot:
+```
+sudo apt update && sudo apt full-upgrade -y && sudo reboot
+```
+
+**Limits on the PS3:** L2 / R2 and the face buttons are on/off (fully pressed or not), with
+no in-between pressure. No motion (SIXAXIS tilt) and no rumble. A few games that only accept
+Sony's own DualShock 3 won't see the pad.
+
+**Not tried on a real PS3 yet.** If it doesn't work, click **Collect logs…** on the Pi tab
+and send the zip: the Pi's report shows which mode the USB side is in.
 
 ## Raspberry Pi 4 on Ethernet
 
@@ -340,7 +387,7 @@ about 3 minutes.
 |---|---|
 | Pi: **Looking up…** | The name lookup is slow or failing. Click **Find Pi**, or enter the Pi's IP address (step 4). |
 | Pi: **No reply** | The Pi is off, still booting, or not on the same network. |
-| Switch: **Not connected** | Check the cable is in the Pi's **USB** port (Pi 4: the **USB-C** port), that it's a data cable, and that the Switch is docked and awake. |
+| Switch / PS3: **Not connected** | Check the cable is in the Pi's **USB** port (Pi 4: the **USB-C** port), that it's a data cable, and that the Switch is docked and awake (or the PS3 is on). |
 | Pi: **Low power!** | The Pi reports under-voltage right now: use a stronger power supply or a better cable. On a Pi 4 powered by the dock, try another dock USB port. |
 | Buttons do nothing in a game, but the Dashboard shows them | Run **Run self-test** on the Pi tab. If it says OK, the Pi ↔ Switch part works and the problem is between the PC and the Pi (see "Wi-Fi lag and hiccups"). |
 | "SwitchPad is already running" | Only one SwitchPad can run. Look for its tray icon (maybe under the ^ arrow next to the clock), or close `SwitchPadBridge.exe`. |

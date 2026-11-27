@@ -86,22 +86,352 @@ static class GuiProgram
     }
 }
 
+// The window is always dark.
 static class Pal
 {
-    public static readonly Color Text = Color.FromArgb(0x1F, 0x23, 0x28);
-    public static readonly Color Muted = Color.FromArgb(0x65, 0x6D, 0x76);
-    public static readonly Color Border = Color.FromArgb(0xD0, 0xD7, 0xDE);
-    public static readonly Color Card = Color.White;
-    public static readonly Color Good = Color.FromArgb(0x1A, 0x7F, 0x37);
-    public static readonly Color Warn = Color.FromArgb(0xBF, 0x87, 0x00);
-    public static readonly Color Bad = Color.FromArgb(0xCF, 0x22, 0x2E);
-    public static readonly Color Idle = Color.FromArgb(0x8C, 0x95, 0x9F);
-    public static readonly Color Accent = Color.FromArgb(0x09, 0x69, 0xDA);
-    public static readonly Color Select = Color.FromArgb(0xE8, 0x7B, 0x00);
-    public static readonly Color Body = Color.FromArgb(0xEA, 0xEE, 0xF2);
-    public static readonly Color BodyEdge = Color.FromArgb(0xAF, 0xB8, 0xC1);
-    public static readonly Color Ring = Color.FromArgb(0xD8, 0xDE, 0xE4);
-    public static readonly Color ButtonEdge = Color.FromArgb(0x8C, 0x95, 0x9F);
+    public static readonly Color Back = Color.FromArgb(0x0F, 0x12, 0x16);       // window and tab pages
+    public static readonly Color Card = Color.FromArgb(0x18, 0x1C, 0x22);       // tiles, graph, pad picture
+    public static readonly Color Raised = Color.FromArgb(0x22, 0x28, 0x30);     // buttons
+    public static readonly Color Hover = Color.FromArgb(0x2C, 0x33, 0x3C);
+    public static readonly Color Input = Color.FromArgb(0x12, 0x16, 0x1B);      // text boxes, lists
+    public static readonly Color Border = Color.FromArgb(0x33, 0x3A, 0x44);
+    public static readonly Color Grid = Color.FromArgb(0x26, 0x2C, 0x34);       // ping graph lines
+    public static readonly Color Text = Color.FromArgb(0xE6, 0xED, 0xF3);
+    public static readonly Color Muted = Color.FromArgb(0x9A, 0xA4, 0xAF);
+    public static readonly Color Idle = Color.FromArgb(0x6E, 0x77, 0x81);
+    public static readonly Color Good = Color.FromArgb(0x3F, 0xB9, 0x50);
+    public static readonly Color Warn = Color.FromArgb(0xD2, 0x99, 0x22);
+    public static readonly Color Bad = Color.FromArgb(0xF8, 0x51, 0x49);
+    public static readonly Color Accent = Color.FromArgb(0x2F, 0x81, 0xF7);
+    public static readonly Color Select = Color.FromArgb(0xF0, 0x88, 0x3E);
+    public static readonly Color SelectBack = Color.FromArgb(0x1F, 0x3A, 0x5F); // selected list row
+    public static readonly Color Body = Color.FromArgb(0x23, 0x29, 0x31);       // pad picture body
+    public static readonly Color BodyEdge = Color.FromArgb(0x4A, 0x53, 0x5E);
+    public static readonly Color Ring = Color.FromArgb(0x2B, 0x32, 0x3B);
+    public static readonly Color Face = Color.FromArgb(0x33, 0x3B, 0x45);       // pad picture buttons
+    public static readonly Color ButtonEdge = Color.FromArgb(0x66, 0x70, 0x7B);
+}
+
+// Dark versions of the standard Windows controls, the title bar and the tray menu.
+static class Dark
+{
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] static extern int SetWindowTheme(IntPtr hwnd, string app, string idList);
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    // Dark title bar: attribute 20 on Windows 10 20H1+ / 11, 19 on older Windows 10 builds.
+    public static void TitleBar(IntPtr hwnd)
+    {
+        int on = 1;
+        try
+        {
+            if (DwmSetWindowAttribute(hwnd, 20, ref on, 4) != 0) DwmSetWindowAttribute(hwnd, 19, ref on, 4);
+        }
+        catch (Exception) { } // no DWM: keeps the normal title bar
+    }
+
+    // Dark scroll bars on text boxes and lists.
+    static void Theme(Control c, string name)
+    {
+        Action set = () => { try { SetWindowTheme(c.Handle, name, null); } catch (Exception) { } };
+        if (c.IsHandleCreated) set();
+        else c.HandleCreated += (s, e) => set();
+    }
+
+    public static void Apply(Control root)
+    {
+        foreach (Control c in root.Controls)
+        {
+            var b = c as Button;
+            if (b != null)
+            {
+                b.FlatStyle = FlatStyle.Flat;
+                b.UseVisualStyleBackColor = false;
+                b.BackColor = Pal.Raised;
+                b.ForeColor = Pal.Text;
+                b.FlatAppearance.BorderColor = Pal.Border;
+                b.FlatAppearance.MouseOverBackColor = Pal.Hover;
+                b.FlatAppearance.MouseDownBackColor = Pal.Border;
+            }
+            else if (c is TextBox)
+            {
+                var t = (TextBox)c;
+                t.BackColor = Pal.Input;
+                t.ForeColor = Pal.Text;
+                t.BorderStyle = BorderStyle.FixedSingle;
+                Theme(c, "DarkMode_Explorer");
+            }
+            else if (c is ListView)
+            {
+                var l = (ListView)c;
+                l.BackColor = Pal.Input;
+                l.ForeColor = Pal.Text;
+                l.BorderStyle = BorderStyle.FixedSingle;
+                Theme(c, "DarkMode_Explorer");
+            }
+            else if (c is ComboBox)
+            {
+                c.BackColor = Pal.Input;
+                c.ForeColor = Pal.Text;
+                continue; // DarkComboBox draws itself
+            }
+            else if (c is NumericUpDown)
+            {
+                var n = (NumericUpDown)c;
+                n.BackColor = Pal.Input;
+                n.ForeColor = Pal.Text;
+                n.BorderStyle = BorderStyle.FixedSingle;
+                // The arrows are drawn by WinForms in the light theme: paint dark ones over them.
+                foreach (Control part in n.Controls)
+                    if (!(part is TextBox)) part.Paint += PaintSpin;
+                continue;
+            }
+            else if (c is CheckBox) continue; // DarkCheckBox draws itself
+            else if (c is TabPage)
+            {
+                var p = (TabPage)c;
+                p.UseVisualStyleBackColor = false;
+                p.BackColor = Pal.Back;
+                p.ForeColor = Pal.Text;
+            }
+            Apply(c);
+        }
+    }
+
+    static void PaintSpin(object sender, PaintEventArgs e)
+    {
+        var c = (Control)sender;
+        var g = e.Graphics;
+        int w = c.Width, h = c.Height;
+        using (var b = new SolidBrush(c.Enabled ? Pal.Raised : Pal.Input)) g.FillRectangle(b, 0, 0, w, h);
+        using (var pen = new Pen(Pal.Border))
+        {
+            g.DrawLine(pen, 0, 0, 0, h);
+            g.DrawLine(pen, 0, h / 2, w, h / 2);
+        }
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        float cx = w / 2f, a = Math.Max(2.5f, Math.Min(w * 0.22f, h * 0.12f));
+        float up = h / 4f, down = h * 3 / 4f;
+        using (var b = new SolidBrush(c.Enabled ? Pal.Text : Pal.Idle))
+        {
+            g.FillPolygon(b, new[] { new PointF(cx - a, up + a / 2), new PointF(cx + a, up + a / 2), new PointF(cx, up - a / 2) });
+            g.FillPolygon(b, new[] { new PointF(cx - a, down - a / 2), new PointF(cx + a, down - a / 2), new PointF(cx, down + a / 2) });
+        }
+    }
+
+    public static void Menu(ContextMenuStrip m)
+    {
+        m.Renderer = new ToolStripProfessionalRenderer(new MenuColors());
+        m.BackColor = Pal.Card;
+        m.ForeColor = Pal.Text;
+        m.ShowImageMargin = false;
+        m.ShowCheckMargin = true;
+    }
+
+    class MenuColors : ProfessionalColorTable
+    {
+        public override Color ToolStripDropDownBackground { get { return Pal.Card; } }
+        public override Color MenuBorder { get { return Pal.Border; } }
+        public override Color MenuItemBorder { get { return Pal.Hover; } }
+        public override Color MenuItemSelected { get { return Pal.Hover; } }
+        public override Color MenuItemSelectedGradientBegin { get { return Pal.Hover; } }
+        public override Color MenuItemSelectedGradientEnd { get { return Pal.Hover; } }
+        public override Color ImageMarginGradientBegin { get { return Pal.Card; } }
+        public override Color ImageMarginGradientMiddle { get { return Pal.Card; } }
+        public override Color ImageMarginGradientEnd { get { return Pal.Card; } }
+        public override Color SeparatorDark { get { return Pal.Border; } }
+        public override Color SeparatorLight { get { return Pal.Card; } }
+        public override Color CheckBackground { get { return Pal.SelectBack; } }
+        public override Color CheckSelectedBackground { get { return Pal.SelectBack; } }
+        public override Color CheckPressedBackground { get { return Pal.SelectBack; } }
+        public override Color ButtonSelectedBorder { get { return Pal.Accent; } }
+    }
+}
+
+// Tab strip drawn in the dark colours (the Windows one is always light).
+class DarkTabControl : TabControl
+{
+    public DarkTabControl()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(Pal.Back);
+        float k = g.DpiX / 96f;
+        if (TabCount == 0) return;
+        Rectangle first = GetTabRect(0);
+        int stripBottom = first.Bottom;
+        using (var pen = new Pen(Pal.Border)) g.DrawLine(pen, 0, stripBottom, Width, stripBottom);
+        for (int i = 0; i < TabCount; i++)
+        {
+            Rectangle r = GetTabRect(i);
+            bool sel = i == SelectedIndex;
+            if (sel)
+            {
+                using (var b = new SolidBrush(Pal.Card)) g.FillRectangle(b, r.X, r.Y, r.Width, r.Height + 1);
+                using (var b = new SolidBrush(Pal.Accent)) g.FillRectangle(b, r.X, r.Bottom - 2 * k, r.Width, 2 * k);
+            }
+            TextRenderer.DrawText(g, TabPages[i].Text, Font, r, sel ? Pal.Text : Pal.Muted,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        }
+    }
+}
+
+// A check box drawn in the dark colours (the Windows one stays light and hides its tick).
+class DarkCheckBox : CheckBox
+{
+    bool hot;
+
+    public DarkCheckBox()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+    }
+
+    public override Size GetPreferredSize(Size proposed)
+    {
+        var s = base.GetPreferredSize(proposed);
+        return new Size(s.Width + (int)(4 * ScreenDpi() / 96f), s.Height);
+    }
+
+    static float ScreenDpi() { using (var g = Graphics.FromHwnd(IntPtr.Zero)) return g.DpiX; }
+
+    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hot = true; Invalidate(); }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hot = false; Invalidate(); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(Parent != null ? Parent.BackColor : Pal.Back);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        float k = g.DpiX / 96f, s = 14 * k;
+        var box = new RectangleF(1, (Height - s) / 2f, s, s);
+        using (var path = Gfx.Rounded(box, 3 * k))
+        {
+            Color fill = Checked ? (Enabled ? Pal.Accent : Pal.Border) : Pal.Input;
+            Color edge = Checked ? fill : !Enabled ? Pal.Border : hot ? Pal.Text : Pal.Muted;
+            using (var b = new SolidBrush(fill)) g.FillPath(b, path);
+            using (var pen = new Pen(edge, 1f)) g.DrawPath(pen, path);
+        }
+        if (Checked)
+            using (var pen = new Pen(Enabled ? Color.White : Pal.Idle, 1.8f * k))
+                g.DrawLines(pen, new[]
+                {
+                    new PointF(box.X + 3.2f * k, box.Y + s * 0.52f),
+                    new PointF(box.X + s * 0.42f, box.Bottom - 3.6f * k),
+                    new PointF(box.Right - 3.2f * k, box.Y + 3.6f * k),
+                });
+        int x = (int)(s + 7 * k);
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(x, 0, Width - x, Height), Enabled ? ForeColor : Pal.Idle,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        if (Focused && ShowFocusCues)
+            using (var pen = new Pen(Pal.Accent) { DashStyle = DashStyle.Dot })
+                g.DrawRectangle(pen, x - 2, 1, Width - x + 1, Height - 3);
+    }
+}
+
+// A drop-down list drawn in the dark colours (the Windows one keeps a light frame).
+class DarkComboBox : ComboBox
+{
+    const int WM_PAINT = 0x000F;
+
+    public DarkComboBox()
+    {
+        DropDownStyle = ComboBoxStyle.DropDownList;
+        DrawMode = DrawMode.OwnerDrawFixed;
+        FlatStyle = FlatStyle.Flat;
+    }
+
+    // The open list's rows.
+    protected override void OnDrawItem(DrawItemEventArgs e)
+    {
+        if (e.Index < 0) return;
+        bool box = (e.State & DrawItemState.ComboBoxEdit) != 0; // the closed box, not the open list
+        bool sel = !box && (e.State & DrawItemState.Selected) != 0;
+        using (var b = new SolidBrush(sel ? Pal.SelectBack : box && !Enabled ? Pal.Back : Pal.Input)) e.Graphics.FillRectangle(b, e.Bounds);
+        TextRenderer.DrawText(e.Graphics, Items[e.Index].ToString(), Font, Rectangle.Inflate(e.Bounds, -3, 0), Enabled ? Pal.Text : Pal.Idle,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+    }
+
+    // The closed box: painted over what Windows drew.
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg != WM_PAINT) return;
+        using (var g = Graphics.FromHwnd(Handle))
+        {
+            float k = g.DpiX / 96f;
+            var r = new Rectangle(0, 0, Width, Height);
+            bool hot = Enabled && ClientRectangle.Contains(PointToClient(Cursor.Position));
+            using (var b = new SolidBrush(Enabled ? Pal.Input : Pal.Back)) g.FillRectangle(b, r);
+            using (var pen = new Pen(Focused || hot ? Pal.Muted : Pal.Border)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+            int arrow = (int)(18 * k);
+            string text = SelectedIndex >= 0 ? Items[SelectedIndex].ToString() : "";
+            TextRenderer.DrawText(g, text, Font, new Rectangle((int)(4 * k), 0, Width - arrow - (int)(4 * k), Height),
+                Enabled ? Pal.Text : Pal.Idle,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float cx = Width - arrow / 2f - 1, cy = Height / 2f, a = 3.5f * k;
+            using (var b = new SolidBrush(Enabled ? Pal.Muted : Pal.Idle))
+                g.FillPolygon(b, new[] { new PointF(cx - a, cy - a / 2), new PointF(cx + a, cy - a / 2), new PointF(cx, cy + a / 2) });
+        }
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); Invalidate(); }
+    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); Invalidate(); }
+}
+
+// The key list, drawn dark (the Windows header and selection colours are light).
+class DarkListView : ListView
+{
+    public DarkListView()
+    {
+        DoubleBuffered = true;
+        OwnerDraw = true;
+    }
+
+    protected override void OnDrawColumnHeader(DrawListViewColumnHeaderEventArgs e)
+    {
+        using (var b = new SolidBrush(Pal.Card)) e.Graphics.FillRectangle(b, e.Bounds);
+        using (var pen = new Pen(Pal.Border))
+        {
+            e.Graphics.DrawLine(pen, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+            e.Graphics.DrawLine(pen, e.Bounds.Right - 1, e.Bounds.Top + 3, e.Bounds.Right - 1, e.Bounds.Bottom - 4);
+        }
+        var r = Rectangle.Inflate(e.Bounds, -5, 0);
+        TextRenderer.DrawText(e.Graphics, e.Header.Text, Font, r, Pal.Muted,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+    }
+
+    protected override void OnDrawItem(DrawListViewItemEventArgs e) { } // the sub-items draw the row
+
+    protected override void OnDrawSubItem(DrawListViewSubItemEventArgs e)
+    {
+        bool sel = e.Item.Selected;
+        using (var b = new SolidBrush(sel ? Pal.SelectBack : BackColor)) e.Graphics.FillRectangle(b, e.Bounds);
+        var r = Rectangle.Inflate(e.Bounds, -5, 0);
+        TextRenderer.DrawText(e.Graphics, e.SubItem.Text, Font, r, e.ColumnIndex == 0 || sel ? Pal.Text : Pal.Muted,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+    }
+
+    // The last column fills the rest of the width, so no light header area is left over.
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        FitLastColumn();
+    }
+
+    public void FitLastColumn()
+    {
+        if (Columns.Count == 0) return;
+        int used = 0;
+        for (int i = 0; i < Columns.Count - 1; i++) used += Columns[i].Width;
+        int w = ClientSize.Width - used;
+        if (w > 40 && Columns[Columns.Count - 1].Width != w) Columns[Columns.Count - 1].Width = w;
+    }
 }
 
 static class Gfx
@@ -155,8 +485,9 @@ static class Gfx
 
 // ------------------------------------------------------------------ controller picture
 
-// Draws a Switch-style pad and lights up what the Switch is receiving. With Mapping on, every
-// button shows its key instead, and clicking a button picks it for a new key.
+// Draws a Switch-style pad and lights up what the console is receiving (with PS3 symbols in PS3
+// mode). With Mapping on, every button shows its key instead, and clicking a button picks it for
+// a new key.
 class PadView : Control
 {
     public byte[] State = Report.Neutral();
@@ -200,6 +531,22 @@ class PadView : Control
         new Part("DRight", "▶", 189, 141, 18, 18, false),
     };
     static readonly PointF LStickC = new PointF(135, 105), RStickC = new PointF(260, 150);
+
+    // PS3 mode: the same spots carry the PS3 buttons (the Pi sends Switch A as Circle etc.).
+    static readonly Dictionary<string, string> Ps3Text = new Dictionary<string, string>
+    {
+        { "ZL", "L2" }, { "L", "L1" }, { "ZR", "R2" }, { "R", "R1" },
+        { "Minus", "▪" }, { "Plus", "▸" }, { "Home", "PS" },
+        { "X", "△" }, { "A", "○" }, { "B", "✕" }, { "Y", "□" },
+    };
+
+    bool Ps3 { get { return Cfg != null && Cfg.Ps3; } }
+
+    string PartText(Part p)
+    {
+        string s;
+        return Ps3 && Ps3Text.TryGetValue(p.Id, out s) ? s : p.Text;
+    }
 
     public PadView()
     {
@@ -280,9 +627,10 @@ class PadView : Control
         }
 
         // D-pad centre
-        using (var b = new SolidBrush(Color.White)) g.FillRectangle(b, 171, 141, 18, 18);
+        using (var b = new SolidBrush(Pal.Face)) g.FillRectangle(b, 171, 141, 18, 18);
 
-        foreach (var p in Parts) DrawPart(g, p, Pressed(p.Id, buttons, hat));
+        foreach (var p in Parts)
+            if (!(Ps3 && p.Id == "Capture")) DrawPart(g, p, Pressed(p.Id, buttons, hat)); // no Capture on a PS3
         DrawStick(g, LStickC, r[3], r[4], "L", (buttons & Report.LCLICK) != 0);
         DrawStick(g, RStickC, r[5], r[6], "R", (buttons & Report.RCLICK) != 0);
     }
@@ -292,7 +640,7 @@ class PadView : Control
         bool sel = Mapping && Selected == p.Id;
         using (var path = p.Circle ? Gfx.Ellipse(p.R) : Gfx.Rounded(p.R, Math.Min(6, p.R.Height / 2)))
         {
-            using (var b = new SolidBrush(pressed ? Pal.Accent : Color.White)) g.FillPath(b, path);
+            using (var b = new SolidBrush(pressed ? Pal.Accent : Pal.Face)) g.FillPath(b, path);
             using (var pen = new Pen(sel ? Pal.Select : Pal.ButtonEdge, sel ? 2.5f : 1.2f)) g.DrawPath(pen, path);
         }
         float size = Math.Min(10f, p.R.Height * 0.55f);
@@ -306,7 +654,7 @@ class PadView : Control
             using (var pen = new Pen(pressed ? Color.White : Pal.Muted, 1.2f))
                 g.DrawEllipse(pen, p.R.X + 4.5f, p.R.Y + 4.5f, p.R.Width - 9, p.R.Height - 9);
         }
-        else Gfx.Text(g, p.Text, p.R, pressed ? Color.White : Pal.Text, size, true);
+        else Gfx.Text(g, PartText(p), p.R, pressed ? Color.White : Pal.Text, size, true);
     }
 
     void DrawStick(Graphics g, PointF c, byte x, byte y, string side, bool clicked)
@@ -319,7 +667,7 @@ class PadView : Control
         if (!Mapping)
         {
             var cap = new RectangleF(c.X + dx * 14 - 18, c.Y + dy * 14 - 18, 36, 36);
-            using (var b = new SolidBrush(clicked ? Pal.Accent : Color.White)) g.FillEllipse(b, cap);
+            using (var b = new SolidBrush(clicked ? Pal.Accent : Pal.Face)) g.FillEllipse(b, cap);
             using (var pen = new Pen(Pal.ButtonEdge, 1.2f)) g.DrawEllipse(pen, cap);
             Gfx.Text(g, side + "S", cap, clicked ? Color.White : Pal.Idle, 8, false);
             return;
@@ -346,7 +694,7 @@ class PadView : Control
         }
         string clickId = side + "S";
         var mid = new RectangleF(c.X - 9, c.Y - 9, 18, 18);
-        using (var b = new SolidBrush(clicked ? Pal.Accent : Color.White)) g.FillEllipse(b, mid);
+        using (var b = new SolidBrush(clicked ? Pal.Accent : Pal.Face)) g.FillEllipse(b, mid);
         using (var pen = new Pen(Selected == clickId ? Pal.Select : Pal.ButtonEdge, Selected == clickId ? 2f : 1f)) g.DrawEllipse(pen, mid);
         string ks = KeyText(clickId);
         Gfx.Text(g, ks, mid, clicked ? Color.White : (ks == "–" ? Pal.Idle : Pal.Text), 8f, true);
@@ -358,6 +706,7 @@ class PadView : Control
         var p = new PointF((pt.X - ox) / scale, (pt.Y - oy) / scale);
         foreach (var part in Parts)
         {
+            if (Ps3 && part.Id == "Capture") continue;
             if (part.Circle)
             {
                 float rx = part.R.Width / 2, ry = part.R.Height / 2;
@@ -391,7 +740,7 @@ class PadView : Control
         {
             var t = Targets.Find(id);
             string keys = Cfg == null ? "" : KeyNames.ListPretty(Cfg.Keys(id));
-            text = (t != null ? t.Label : id) + (keys.Length == 0 ? ": no key" : ": " + keys) +
+            text = (t != null ? t.LabelFor(Ps3) : id) + (keys.Length == 0 ? ": no key" : ": " + keys) +
                    (Mapping ? "\nClick it, then press a key to change it." : "");
         }
         tip.SetToolTip(this, text);
@@ -489,7 +838,7 @@ class PingGraph : Control
         var plot = new RectangleF(pad, pad + 24 * k, Width - 2 * pad - 34 * k, Height - 2 * pad - 24 * k);
         if (plot.Width < 10 || plot.Height < 10 || d.Length == 0) return;
         double top = Math.Max(20, Math.Ceiling(max * 1.25 / 10) * 10);
-        using (var pen = new Pen(Color.FromArgb(0xEA, 0xEE, 0xF2)))
+        using (var pen = new Pen(Pal.Grid))
         {
             g.DrawLine(pen, plot.Left, plot.Top, plot.Right, plot.Top);
             g.DrawLine(pen, plot.Left, plot.Top + plot.Height / 2, plot.Right, plot.Top + plot.Height / 2);
@@ -531,14 +880,14 @@ class MainForm : Form
     StatusTile tilePi, tileSwitch, tilePing, tileInput;
     PadView dashPad, mapPad;
     PingGraph graph;
-    Label lblDetails, lblCapture, lblPiHint, lblSlots, lblHealthNote, lblReplies;
+    Label lblDetails, lblCapture, lblPiHint, lblSlots, lblHealthNote, lblReplies, lblDashHeading, lblConsoleHint;
     readonly Dictionary<string, Label> healthValues = new Dictionary<string, Label>();
     Button btnSelftest, btnRestart, btnReboot;
     ListView mapList;
     CheckBox chkKeyboard, chkBlock, chkRemote, chkStartup, chkMinimized;
     NumericUpDown numWalk, numTrigger, numDeadzone;
     TextBox txtPi, txtLog, txtUser;
-    ComboBox cmbPad, cmbLayout;
+    ComboBox cmbPad, cmbLayout, cmbConsole;
     TabControl tabs;
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
     readonly ToolTip tips = new ToolTip();
@@ -555,6 +904,8 @@ class MainForm : Form
         allowShow = !startHidden;
         Text = "SwitchPad";
         Font = new Font("Segoe UI", 9f);
+        BackColor = Pal.Back;
+        ForeColor = Pal.Text;
         using (var g = CreateGraphics()) dpi = g.DpiX / 96f;
         ClientSize = new Size(S(960), S(640));
         MinimumSize = new Size(S(800), S(560));
@@ -584,6 +935,12 @@ class MainForm : Form
 
     int S(int px) { return (int)Math.Round(px * dpi); }
 
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Dark.TitleBar(Handle);
+    }
+
     // ---------------------------------------------------------------- layout
 
     void BuildUi()
@@ -604,7 +961,7 @@ class MainForm : Form
         tiles.Controls.Add(tileInput, 3, 0);
         root.Controls.Add(tiles, 0, 0);
 
-        tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(S(14), S(5)) };
+        tabs = new DarkTabControl { Dock = DockStyle.Fill, Padding = new Point(S(14), S(5)) };
         tabs.TabPages.Add(BuildDashboard());
         tabs.TabPages.Add(BuildKeyboard());
         tabs.TabPages.Add(BuildPi());
@@ -613,6 +970,7 @@ class MainForm : Form
         tabs.SelectedIndexChanged += (s, e) => CancelCapture(null);
         root.Controls.Add(tabs, 0, 1);
         Controls.Add(root);
+        Dark.Apply(this);
         foreach (Control c in new Control[] { txtPi, txtUser, numTrigger, numDeadzone, numWalk }) PauseKeysWhileFocused(c);
     }
 
@@ -655,7 +1013,7 @@ class MainForm : Form
 
     CheckBox Check(string text, string tip)
     {
-        var c = new CheckBox { Text = text, AutoSize = true, Margin = new Padding(0, S(4), S(18), S(4)) };
+        var c = new DarkCheckBox { Text = text, AutoSize = true, Margin = new Padding(0, S(4), S(18), S(4)) };
         if (tip != null) tips.SetToolTip(c, tip);
         return c;
     }
@@ -667,7 +1025,7 @@ class MainForm : Form
 
     ComboBox Combo(params string[] items)
     {
-        var c = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = S(270), Margin = new Padding(0, S(3), 0, S(3)) };
+        var c = new DarkComboBox { Width = S(270), Margin = new Padding(0, S(3), 0, S(3)) };
         c.Items.AddRange(items);
         return c;
     }
@@ -689,7 +1047,8 @@ class MainForm : Form
         var left = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(0, 0, S(10), 0) };
         left.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         left.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        left.Controls.Add(Heading("What the Switch receives"), 0, 0);
+        lblDashHeading = Heading("What the Switch receives");
+        left.Controls.Add(lblDashHeading, 0, 0);
         dashPad = new PadView { Dock = DockStyle.Fill, Margin = new Padding(0) };
         left.Controls.Add(dashPad, 0, 1);
         grid.Controls.Add(left, 0, 0);
@@ -719,9 +1078,9 @@ class MainForm : Form
         outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        chkKeyboard = Check("Use the keyboard", "Keys (from Parsec, or typed on this PC) drive the Switch as mapped below.");
+        chkKeyboard = Check("Use the keyboard", "Keys (from Parsec, or typed on this PC) drive the console as mapped below.");
         chkBlock = Check("Hide mapped keys from other programs",
-            "Mapped keys only go to the Switch, not also to whichever window has focus on this PC.\n" +
+            "Mapped keys only go to the console, not also to whichever window has focus on this PC.\n" +
             "Careful: while this is on, those keys don't type anywhere on this PC.");
         chkRemote = Check("Only keys sent by programs (Parsec)",
             "Ignore keys typed on this PC's own keyboard; use only keys that a program like Parsec sends.\n" +
@@ -743,7 +1102,7 @@ class MainForm : Form
         var side = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(0) };
         side.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         side.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        mapList = new ListView
+        mapList = new DarkListView
         {
             Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, HideSelection = false,
             MultiSelect = false, HeaderStyle = ColumnHeaderStyle.Nonclickable,
@@ -751,7 +1110,7 @@ class MainForm : Form
         mapList.Columns.Add("Switch", S(170));
         mapList.Columns.Add("Key", S(100));
         mapList.Columns.Add("2nd key", S(100));
-        foreach (var t in Targets.All) mapList.Items.Add(new ListViewItem(new[] { t.Label, "", "" }) { Tag = t.Id });
+        foreach (var t in Targets.All) mapList.Items.Add(new ListViewItem(new[] { t.LabelFor(cfg.Ps3), "", "" }) { Tag = t.Id });
         mapList.SelectedIndexChanged += (s, e) =>
         {
             if (mapList.SelectedItems.Count == 0) return;
@@ -792,7 +1151,8 @@ class MainForm : Form
         new[] { "net", "Network" },
         new[] { "temp", "CPU temperature" },
         new[] { "power", "Power" },
-        new[] { "usb", "USB to the Switch" },
+        new[] { "usb", "USB to the console" },
+        new[] { "console", "Console mode" },
         new[] { "up", "Running for" },
         new[] { "packets", "Packets from this PC" },
         new[] { "problems", "Hiccups and errors" },
@@ -835,7 +1195,7 @@ class MainForm : Form
         row = 0;
         AddSpan(right, ref row, Heading("Controls"));
         btnSelftest = ActionRow(right, ref row, "Run self-test",
-            "The Pi plays the test pattern by itself (12 s) and checks that the Switch takes every report. " +
+            "The Pi plays the test pattern by itself (12 s) and checks that the console takes every report. " +
             "Tests the Pi and its cable without the network. Your input pauses meanwhile.", (s, e) => engine.Command("selftest"));
         btnRestart = ActionRow(right, ref row, "Restart SwitchPad", "Restarts the program on the Pi. The controller is gone for about 5 s.",
             (s, e) => { if (Confirm("Restart SwitchPad on the Pi? The controller is gone for about 5 seconds.")) engine.Command("restart"); });
@@ -1016,6 +1376,16 @@ class MainForm : Form
         SetHealth("power", PowerText(h, out pc), c(pc));
         Color uc;
         SetHealth("usb", UsbText(h["usb"], h["usb_speed"], out uc), c(uc));
+        string mode = h["console"], ps = h["ps_button"];
+        if (mode.Length == 0)
+            SetHealth("console", cfg.Ps3 ? "This Pi's SwitchPad has no PS3 mode yet: use Update Pi" : "Switch (older SwitchPad)",
+                c(cfg.Ps3 ? Pal.Bad : Pal.Text));
+        else if (mode != cfg.ConsoleId)
+            SetHealth("console", (mode == "ps3" ? "PS3" : "Switch") + ", switching to " + cfg.ConsoleName + "…", c(Pal.Warn));
+        else if (mode == "ps3")
+            SetHealth("console", ps == "ok" ? "PS3 (PS button works)" : "PS3 (PS button: " + (ps.Length > 0 ? ps : "?") + ")",
+                c(ps == "ok" ? Pal.Good : Pal.Warn));
+        else SetHealth("console", "Switch", c(Pal.Text));
         SetHealth("up", "Pi " + Dur(h.Num("uptime")) + "   ·   SwitchPad " + Dur(h.Num("running")), c(Pal.Text));
         SetHealth("packets", Count(h, "rx") + " received, " + Count(h, "lost") + " lost, " + Count(h, "late") + " out of order", c(Pal.Text));
         bool clean = h.Num("hiccups") == 0 && h.Num("failsafe") == 0 && h.Num("usb_err") == 0;
@@ -1046,9 +1416,9 @@ class MainForm : Form
         string s;
         switch (state)
         {
-            case "configured": color = Pal.Good; s = "In use by the Switch"; break;
-            case "not attached": color = Pal.Bad; s = "Not connected (cable, or Switch not docked / asleep?)"; break;
-            case "suspended": color = Pal.Warn; s = "Suspended (is the Switch asleep?)"; break;
+            case "configured": color = Pal.Good; s = "In use by the console"; break;
+            case "not attached": color = Pal.Bad; s = "Not connected (cable, or console off / Switch not docked?)"; break;
+            case "suspended": color = Pal.Warn; s = "Suspended (is the console asleep?)"; break;
             case "gadget not bound": color = Pal.Bad; s = "USB controller mode isn't set up on the Pi"; break;
             case "": case "None": color = Pal.Idle; s = "–"; break;
             default: color = Pal.Warn; s = "Connecting (" + state + ")"; break;
@@ -1075,11 +1445,16 @@ class MainForm : Form
         lblSlots = Hint("");
         AddRow(t, ref row, "Controller", cmbPad, lblSlots);
 
+        cmbConsole = Combo("Nintendo Switch", "PlayStation 3");
+        lblConsoleHint = Hint("");
+        AddRow(t, ref row, "Console", cmbConsole, lblConsoleHint);
+
         cmbLayout = Combo("Same position (Xbox A → Switch B)", "Same letter (Xbox A → Switch A)");
-        AddRow(t, ref row, "Button layout", cmbLayout, Hint("Which Switch button each Xbox face button presses."));
+        AddRow(t, ref row, "Button layout", cmbLayout, Hint("Which Switch button each Xbox face button presses. " +
+            "On a PS3 it is always by position: Xbox A → Cross, B → Circle, X → Square, Y → Triangle."));
 
         numTrigger = Num(1, 254);
-        AddRow(t, ref row, "ZL / ZR trigger point", numTrigger, Hint("How far LT / RT must be pulled to press ZL / ZR, out of 255. Default 30."));
+        AddRow(t, ref row, "Trigger point", numTrigger, Hint("How far LT / RT must be pulled to press ZL / ZR (L2 / R2 on a PS3), out of 255. Default 30."));
 
         numDeadzone = Num(0, 50);
         AddRow(t, ref row, "Stick deadzone (%)", numDeadzone, Hint("Ignores small stick movements around the centre (against stick drift). Default 0 = off."));
@@ -1090,7 +1465,7 @@ class MainForm : Form
         AddRow(t, ref row, "", chkMinimized, null);
 
         AddRow(t, ref row, "Test", Btn("Send test pattern (12 s)", (s, e) => engine.StartTest()),
-            Hint("Presses L+R three times, D-pad right and left, then circles the left stick. " +
+            Hint("Presses L+R (L1+R1 on a PS3) three times, D-pad right and left, then circles the left stick. " +
                  "To register the controller, open Controllers > Change Grip/Order on the Switch first."));
         AddRow(t, ref row, "Files", Btn("Open logs folder", (s, e) => OpenFolder(Log.Dir)),
             Hint("Settings are saved in " + Settings.FilePath));
@@ -1099,6 +1474,7 @@ class MainForm : Form
         page.Controls.Add(t);
 
         cmbPad.SelectedIndexChanged += (s, e) => Change(x => x.Pad = cmbPad.SelectedIndex - 1);
+        cmbConsole.SelectedIndexChanged += (s, e) => Change(x => x.Ps3 = cmbConsole.SelectedIndex == 1);
         cmbLayout.SelectedIndexChanged += (s, e) => Change(x => x.Positional = cmbLayout.SelectedIndex == 0);
         numTrigger.ValueChanged += (s, e) => Change(x => x.TriggerThreshold = (int)numTrigger.Value);
         numDeadzone.ValueChanged += (s, e) => Change(x => x.Deadzone = (int)numDeadzone.Value);
@@ -1125,7 +1501,7 @@ class MainForm : Form
         txtLog = new TextBox
         {
             Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false,
-            Dock = DockStyle.Fill, Font = new Font("Consolas", 9f), BackColor = SystemColors.Window,
+            Dock = DockStyle.Fill, Font = new Font("Consolas", 9f),
         };
         t.Controls.Add(txtLog, 0, 0);
         var bottom = Flow(Btn("Open logs folder", (s, e) => OpenFolder(Log.Dir)), Hint("Everything here is also in " + Log.FilePath));
@@ -1141,6 +1517,7 @@ class MainForm : Form
         txtPi.Text = cfg.Pi;
         txtUser.Text = cfg.PiUser;
         cmbPad.SelectedIndex = cfg.Pad + 1;
+        cmbConsole.SelectedIndex = cfg.Ps3 ? 1 : 0;
         cmbLayout.SelectedIndex = cfg.Positional ? 0 : 1;
         numTrigger.Value = cfg.TriggerThreshold;
         numDeadzone.Value = cfg.Deadzone;
@@ -1181,15 +1558,32 @@ class MainForm : Form
     void RefreshKeys()
     {
         chkBlock.Enabled = chkRemote.Enabled = numWalk.Enabled = cfg.Keyboard;
+        ApplyConsoleLabels();
         mapList.BeginUpdate();
         foreach (ListViewItem it in mapList.Items)
         {
+            var t = Targets.Find((string)it.Tag);
+            if (t != null && it.Text != t.LabelFor(cfg.Ps3)) it.Text = t.LabelFor(cfg.Ps3);
             int[] k = cfg.Keys((string)it.Tag);
             it.SubItems[1].Text = k[0] != 0 ? KeyNames.Pretty(k[0]) : "–";
             it.SubItems[2].Text = k[1] != 0 ? KeyNames.Pretty(k[1]) : "";
         }
         mapList.EndUpdate();
         foreach (var p in new[] { mapPad, dashPad }) { p.Cfg = cfg; p.ResetTip(); p.Invalidate(); }
+    }
+
+    // Texts that name the console (Switch or PS3).
+    void ApplyConsoleLabels()
+    {
+        string name = cfg.ConsoleName;
+        lblDashHeading.Text = "What the " + name + " receives";
+        if (tileSwitch.Title != name) { tileSwitch.Title = name; tileSwitch.Invalidate(); }
+        if (mapList.Columns[0].Text != name) mapList.Columns[0].Text = name;
+        cmbLayout.Enabled = !cfg.Ps3;
+        lblConsoleHint.Text = cfg.Ps3
+            ? "The Pi acts as a PS3 pad: Guide (or Back+Start) is the PS button, Back / Start are Select / Start. " +
+              "No motion, rumble or pressure-sensitive buttons. Changing this reconnects the controller for a second."
+            : "The Pi acts as a wired Switch pad (HORI Pokken style). Changing this reconnects the controller for a second.";
     }
 
     void SelectTarget(string id)
@@ -1218,7 +1612,7 @@ class MainForm : Form
         capturingFor = selected;
         captureSlot = slot;
         var t = Targets.Find(selected);
-        lblCapture.Text = "Press a key for " + t.Label + (slot == 1 ? " (2nd key)" : "") + "…   Esc cancels.";
+        lblCapture.Text = "Press a key for " + t.LabelFor(cfg.Ps3) + (slot == 1 ? " (2nd key)" : "") + "…   Esc cancels.";
         lblCapture.ForeColor = Pal.Select;
         KeyboardHook.BeginCapture(vk =>
         {
@@ -1262,8 +1656,8 @@ class MainForm : Form
         Commit(s);
 
         var t = Targets.Find(id);
-        string msg = KeyNames.Pretty(vk) + " → " + t.Label;
-        if (takenFrom != null) msg += "   (" + KeyNames.Pretty(vk) + " no longer does " + Targets.Find(takenFrom).Label + ")";
+        string msg = KeyNames.Pretty(vk) + " → " + t.LabelFor(cfg.Ps3);
+        if (takenFrom != null) msg += "   (" + KeyNames.Pretty(vk) + " no longer does " + Targets.Find(takenFrom).LabelFor(cfg.Ps3) + ")";
         lblCapture.Text = msg;
         Log.Write("Key map: " + t.Label + " = " + KeyNames.ListPretty(keys) +
                   (takenFrom != null ? " (taken from " + Targets.Find(takenFrom).Label + ")" : ""));
@@ -1276,7 +1670,7 @@ class MainForm : Form
         var s = cfg.Clone();
         s.KeyMap[selected] = new int[2];
         Commit(s);
-        lblCapture.Text = "No key for " + Targets.Find(selected).Label + " now.";
+        lblCapture.Text = "No key for " + Targets.Find(selected).LabelFor(cfg.Ps3) + " now.";
     }
 
     void ResetKeys()
@@ -1366,8 +1760,8 @@ class MainForm : Form
         else tilePi.Set("No reply", sn.Address, Pal.Bad);
 
         if (!sn.Online) tileSwitch.Set("Unknown", "Waiting for the Pi", Pal.Idle);
-        else if (sn.Attached) tileSwitch.Set("Connected", "The Switch is using the controller", Pal.Good);
-        else tileSwitch.Set("Not connected", "Is the Switch docked and awake?", Pal.Bad);
+        else if (sn.Attached) tileSwitch.Set("Connected", "The " + cfg.ConsoleName + " is using the controller", Pal.Good);
+        else tileSwitch.Set("Not connected", cfg.Ps3 ? "Is the PS3 on, cable in its USB port?" : "Is the Switch docked and awake?", Pal.Bad);
 
         double sum = 0;
         int n = 0;
@@ -1428,7 +1822,7 @@ class MainForm : Form
     string Details(Snapshot sn)
     {
         var lines = new List<string>();
-        string sending = Report.Describe(sn.Current);
+        string sending = Report.Describe(sn.Current, cfg.Ps3);
         lines.Add("Sending:  " + (sending == "-" ? "nothing pressed" : sending));
         lines.Add("Controller:  " + (sn.PadSlot >= 0 ? "XInput slot " + sn.PadSlot : "none") +
                   "   (connected slots: " + sn.Slots + ")");
@@ -1466,6 +1860,7 @@ class MainForm : Form
         menu.Items.Add(trayKeyboard);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Quit SwitchPad", null, (s, e) => Close());
+        Dark.Menu(menu);
         tray.ContextMenuStrip = menu;
         tray.Text = "SwitchPad";
         tray.DoubleClick += (s, e) => ShowFromTray();
@@ -1476,7 +1871,7 @@ class MainForm : Form
     void UpdateTray(Snapshot sn)
     {
         int state = !sn.Online ? 0 : sn.Attached ? 2 : 1;
-        string text = "SwitchPad: " + (!sn.Online ? "Pi not answering" : sn.Attached ? "Switch connected" : "Switch not connected") +
+        string text = "SwitchPad: " + (!sn.Online ? "Pi not answering" : cfg.ConsoleName + (sn.Attached ? " connected" : " not connected")) +
                       (sn.Online && sn.Ping >= 0 ? ", " + Ms(sn.Ping) : "");
         if (text.Length > 63) text = text.Substring(0, 63);
         if (tray.Text != text) tray.Text = text;
