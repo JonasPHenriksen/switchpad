@@ -20,14 +20,19 @@ Commands (run as root):
 
 Logs: switchpad.log next to this file (on the SD card), the journal, and the HDMI screen.
 An empty file named 'fullspeed' next to this file makes the USB side full-speed only.
+An empty file named 'lowpower' turns on low-power mode (for a Pi 4 on a weak USB port):
+CPU at its lowest speed, LEDs off, the Wi-Fi radio off while the PC talks to the Pi over
+Ethernet, and Ethernet at 100 Mbit/s. The PC switches it with the "lowpower" command.
 """
 import errno
 import fcntl
+import glob
 import math
 import os
 import queue
 import re
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -37,7 +42,7 @@ import threading
 import time
 import traceback
 
-VERSION = "2026-11-27"   # shown in SwitchPad.exe's Pi tab
+VERSION = "2026-11-27b"  # shown in SwitchPad.exe's Pi tab
 
 GADGET = "/sys/kernel/config/usb_gadget/switchpad"
 HIDG = "/dev/hidg0"
@@ -49,7 +54,8 @@ MAGIC_STATUS = b"SWS1"   # Pi -> PC: magic(4) + switch_attached(1) + version 1 (
                          # Unchanged since v1, so older PC software keeps working.
 MAGIC_HEALTH = b"SWH1"   # Pi -> PC every 2 s: magic + UTF-8 "key=value" lines (see health_msg)
 MAGIC_CMD = b"SWC1"      # PC -> Pi: magic + nonce uint32 LE + command text
-                         # (ping, selftest, restart, reboot, "console switch", "console ps3")
+                         # (ping, selftest, restart, reboot, "console switch", "console ps3",
+                         # "lowpower on", "lowpower off")
 MAGIC_REPLY = b"SWR1"    # Pi -> PC: magic + that nonce + reply text, starting "ok", "done" or "error"
 FAILSAFE_S = 0.5         # release everything if the PC goes quiet this long
 GAP_S = 0.15             # the PC sends at least every 50 ms; a longer silence is a network hiccup
@@ -624,7 +630,171 @@ PI_MODEL = pi_model()
 # Slow readings (a vcgencmd/iw/ip call takes tens of ms on a Pi Zero) are taken on a background
 # thread, so the bridge loop never waits for them.
 health = {"power": "?", "power_raw": "", "link": "?", "link_kind": "", "dev": "", "temp": "",
-          "load": "", "selftest": "", "peer": None}
+          "load": "", "selftest": "", "peer": None, "rx_at": 0.0}
+
+
+# ---------------------------------------------------------------- low-power mode
+# For a Pi 4 on a USB port that can't quite power it (a PS3, some dock ports): it browns out and
+# restarts. Everything here is applied while running and undone at the next boot (except the
+# Wi-Fi block, which Linux keeps over a reboot, so SwitchPad remembers that it set it). Nothing
+# is written to config.txt: a power cut while writing it could leave the Pi unable to boot.
+
+WIFI_MARK = "/var/lib/switchpad/wifi-off-by-switchpad"
+LOW_POWER = False      # what is applied right now
+low_power_text = {}    # part -> short text for the PC's Pi tab
+_saved = {}            # original CPU governor and LED triggers, to put back
+
+
+def wanted_low_power():
+    path = card_file("lowpower")
+    return bool(path and os.path.exists(path))
+
+
+def save_low_power(on):
+    path = card_file("lowpower")
+    if not path:
+        raise OSError("no SwitchPad folder on the SD card to keep the setting in")
+    if on:
+        with open(path, "w") as f:
+            os.fsync(f.fileno())
+    elif os.path.exists(path):
+        os.remove(path)
+    os.sync()
+
+
+def _selected(path):
+    """The [selected] entry of a sysfs choice file like 'none [mmc0] timer'."""
+    m = re.search(r"\[([^\]]+)\]", read_attr(path))
+    return m.group(1) if m else None
+
+
+def lp_cpu(on):
+    policies = sorted(glob.glob("/sys/devices/system/cpu/cpufreq/policy*"))
+    if not policies:
+        return "no CPU speed control"
+    gov_file = os.path.join(policies[0], "scaling_governor")
+    if on:
+        if "powersave" not in read_attr(os.path.join(policies[0], "scaling_available_governors")).split():
+            return "CPU: no powersave governor"
+        cur = read_attr(gov_file)
+        if cur == "powersave":  # still set from before SwitchPad restarted: use the usual default
+            avail = read_attr(os.path.join(policies[0], "scaling_available_governors")).split()
+            cur = "ondemand" if "ondemand" in avail else "schedutil" if "schedutil" in avail else ""
+        if cur:
+            _saved.setdefault("governor", cur)
+        want = "powersave"
+    else:
+        want = _saved.pop("governor", None)
+        if not want:
+            return "CPU normal"
+    for p in policies:
+        try:
+            write_attr(os.path.join(p, "scaling_governor"), want)
+        except OSError as e:
+            return "CPU: can't set %s (%s)" % (want, e.strerror)
+    if on:
+        mhz = read_attr(os.path.join(policies[0], "scaling_min_freq"))
+        return "CPU %s MHz" % (int(mhz) // 1000) if mhz.isdigit() else "CPU slowest"
+    return "CPU normal"
+
+
+def lp_leds(on):
+    leds = [d for d in ("/sys/class/leds/ACT", "/sys/class/leds/PWR",
+                        "/sys/class/leds/led0", "/sys/class/leds/led1") if os.path.isdir(d)]
+    if not leds:
+        return ""
+    for d in leds:
+        try:
+            if on:
+                trig = _selected(os.path.join(d, "trigger"))
+                if trig in (None, "none"):  # still off from before SwitchPad restarted: Pi defaults
+                    trig = "default-on" if d.endswith(("PWR", "led1")) else "mmc0"
+                _saved.setdefault("led:" + d, trig)
+                write_attr(os.path.join(d, "trigger"), "none")
+                write_attr(os.path.join(d, "brightness"), "0")
+            else:
+                trig = _saved.pop("led:" + d, None)
+                if trig:
+                    write_attr(os.path.join(d, "trigger"), trig)
+        except OSError:
+            pass
+    return "LEDs off" if on else ""
+
+
+def lp_ethernet(on):
+    """100 Mbit/s instead of 1 Gbit/s uses less power and is plenty for controller input. Only
+    changed when needed: every change makes the link reconnect (about 3 s)."""
+    if not os.path.isdir("/sys/class/net/eth0"):
+        return ""
+    tool = shutil.which("ethtool")
+    if not tool:
+        return "Ethernet unchanged (ethtool missing)"
+    try:
+        out = subprocess.run([tool, "eth0"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return "Ethernet unchanged"
+    m = re.search(r"Advertised link modes:(.*?)\n\s*Advertised pause", out, re.S)
+    gigabit = m is not None and "1000base" in m.group(1)
+    if on and gigabit:
+        mask, text = "0x00f", "Ethernet 100 Mbit/s"
+    elif not on and m is not None and not gigabit and "1000baseT/Full" in out:
+        mask, text = "0x02f", "Ethernet normal"
+    else:
+        return "Ethernet 100 Mbit/s" if on else ""
+    try:
+        subprocess.run([tool, "-s", "eth0", "advertise", mask], timeout=5, check=True)
+        log("Low power: Ethernet set to %s (the link reconnects once)" % ("100 Mbit/s" if on else "full speed"))
+        return text
+    except (OSError, subprocess.SubprocessError) as e:
+        return "Ethernet unchanged (%s)" % e
+
+
+def _wifi_rfkill():
+    for d in glob.glob("/sys/class/rfkill/rfkill*"):
+        if read_attr(os.path.join(d, "type")) == "wlan":
+            return d
+    return None
+
+
+def lp_wifi_check():
+    """Wi-Fi radio off while low-power mode is on and the PC reaches the Pi over Ethernet; on
+    again as soon as that stops (cable out, or the PC quiet for a minute), so the Pi never cuts
+    itself off from the PC. Called every few seconds from the health thread."""
+    d = _wifi_rfkill()
+    if not d:
+        return ""
+    blocked = read_attr(os.path.join(d, "soft")) == "1"
+    mine = os.path.exists(WIFI_MARK)
+    over_ethernet = (health["link_kind"] == "ethernet" and health["peer"] is not None
+                     and time.monotonic() - health["rx_at"] < 60)
+    try:
+        if LOW_POWER and over_ethernet:
+            if not blocked:
+                os.makedirs(os.path.dirname(WIFI_MARK), exist_ok=True)
+                open(WIFI_MARK, "w").close()
+                write_attr(os.path.join(d, "soft"), "1")
+                log("Low power: Wi-Fi radio off (the PC uses Ethernet)")
+            return "Wi-Fi off"
+        if mine:
+            write_attr(os.path.join(d, "soft"), "0")
+            os.remove(WIFI_MARK)
+            log("Low power: Wi-Fi radio on again")
+    except OSError as e:
+        return "Wi-Fi: %s" % e.strerror
+    return "Wi-Fi on" if LOW_POWER else ""
+
+
+def set_low_power(on):
+    """Apply or undo low-power mode now."""
+    global LOW_POWER
+    LOW_POWER = on
+    low_power_text.update(cpu=lp_cpu(on), leds=lp_leds(on), eth=lp_ethernet(on), wifi=lp_wifi_check())
+    log("Low-power mode %s: %s" % ("ON" if on else "off", low_power_summary()))
+
+
+def low_power_summary():
+    parts = [low_power_text.get(k, "") for k in ("cpu", "leds", "wifi", "eth")]
+    return ", ".join(p for p in parts if p) or "-"
 
 
 def health_loop():
@@ -646,6 +816,8 @@ def health_loop():
                 else:
                     log("Network: %s connection LOST (%s)" % (dev, desc))
             last = (dev, connected)
+            if LOW_POWER or os.path.exists(WIFI_MARK):
+                low_power_text["wifi"] = lp_wifi_check()
         except Exception as e:  # never let a reading crash anything
             health["link"] = "error %r" % e
         time.sleep(5)
@@ -718,6 +890,8 @@ def run():
         % (VERSION, os.path.abspath(__file__), sys.version.split()[0], PI_MODEL, throttled(),
            net_link()[2]))
     start_log_thread()
+    if wanted_low_power():
+        set_low_power(True)
     threading.Thread(target=health_loop, daemon=True).start()
 
     def on_term(*_):
@@ -761,6 +935,8 @@ def run():
             ("hiccups", tot["gaps"]), ("failsafe", tot["failsafe"]), ("usb_err", tot["hid_err"]),
             ("selftest", "running" if selftest else health["selftest"]),
             ("console", CONSOLE), ("ps_button", PS_BUTTON if CONSOLE == "ps3" else ""),
+            ("lowpower", "on" if LOW_POWER else "off"),
+            ("lowpower_text", low_power_summary() if LOW_POWER else ""),
         ]
         text = "".join("%s=%s\n" % (k, str(v).replace("\n", " ")) for k, v in fields)
         return MAGIC_HEALTH + text.encode("utf-8")
@@ -787,7 +963,8 @@ def run():
         if addr != br.peer:
             reply(nonce, "error: commands are only taken from the PC that is sending input", addr)
             return
-        after = None
+        after = None       # a program to start after answering
+        after_call = None  # or a function to run (on its own thread) after answering
         if cmd == "ping":
             text = "ok: pong (SwitchPad %s on %s)" % (VERSION, PI_MODEL)
         elif cmd == "selftest":
@@ -824,6 +1001,19 @@ def run():
                             "in a second" % name)
                 except OSError as e:
                     text = "error: could not save the %s setting on the SD card: %s" % (name, e)
+        elif cmd in ("lowpower on", "lowpower off"):
+            on = cmd.endswith("on")
+            if on == LOW_POWER and wanted_low_power() == on:
+                text = "ok: low-power mode is already %s" % ("on" if on else "off")
+            else:
+                try:
+                    save_low_power(on)
+                    # Applied after answering: a change of Ethernet speed drops the link for ~3 s.
+                    after_call = lambda: set_low_power(on)
+                    text = ("ok: low-power mode %s (the Pi tab shows what changed; Ethernet may "
+                            "reconnect for a few seconds)" % ("on" if on else "off"))
+                except OSError as e:
+                    text = "error: could not save the low-power setting on the SD card: %s" % e
         else:
             text = "error: unknown command %r (this Pi runs SwitchPad %s)" % (cmd, VERSION)
         recent_cmds[nonce] = text
@@ -831,6 +1021,8 @@ def run():
             del recent_cmds[next(iter(recent_cmds))]
         log("Command from %s: %s -> %s" % (addr[0], cmd, text), sync=after is not None)
         reply(nonce, text, addr)
+        if after_call:  # e.g. ethtool: never hold up the input loop for it
+            threading.Thread(target=after_call, daemon=True).start()
         if after:
             try:
                 subprocess.Popen(after)
@@ -934,6 +1126,7 @@ def run():
                     br.peer = addr
                     health["peer"] = addr[0]
                 last_seq = seq
+                health["rx_at"] = now
                 br.count("rx")
                 br.got_report(data[8:16], now)
 
@@ -1084,6 +1277,9 @@ REPORT_CMDS = [
     ("config.txt (dwc2, disable-bt) and cmdline.txt",
      "grep -nE 'dwc2|disable-bt|disable-wifi' /boot/firmware/config.txt; cat /boot/firmware/cmdline.txt"),
     ("network: addresses and routes", "ip -br addr; ip route"),
+    ("low-power mode", "ls -l /boot/firmware/switchpad/lowpower " + WIFI_MARK + " 2>&1; "
+                       "cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor; "
+                       "ethtool eth0 2>&1 | grep -iE 'speed|advertised link' -A2 | head -8"),
     ("ethernet", "for f in carrier speed duplex; do echo \"eth0 $f: $(cat /sys/class/net/eth0/$f 2>&1)\"; done; "
                  "ip -s link show eth0 2>&1 | head -8"),
     ("wifi", "iw dev wlan0 link; iw dev wlan0 get power_save; iw dev wlan0 station dump "
